@@ -1,8 +1,14 @@
 """
-ePRO Chart Generator v8 — Streamlit Edition
-=============================================
-Run with:  streamlit run epro_streamlit.py
+ePRO Chart Generator v9 — Streamlit Edition (Config-Aware)
+============================================================
+Run with:  streamlit run epro_streamlit_v9.py
 Requires:  pip install streamlit pandas numpy matplotlib openpyxl
+
+NEW IN v9:
+  - Import JSON config exported from the VBA UserForm
+  - Skips scale verification, subject inclusion, and title editing
+    when config is loaded (all decisions already finalized)
+  - Falls back to manual workflow if no config provided
 """
 import streamlit as st
 import pandas as pd
@@ -18,6 +24,7 @@ import re
 import textwrap
 import tempfile
 import os
+import json
 
 # ═══════════════════════════════════════════════════════════════
 # 1. CONFIGURATION & STYLE
@@ -74,7 +81,9 @@ class QuestionInfo:
         self.levels = levels or {}
         self.is_scaled = len(self.levels) > 0
         self.is_open_ended = not self.is_scaled
+        self.is_multi_select = False
         self.fav_mask = []
+        self.neutral_mask = None
         self.q_number = self._extract_q_number()
 
     def _extract_q_number(self):
@@ -101,14 +110,99 @@ class TimepointData:
         self.included_subjects = []
         self.non_completed = []
         self.dropped_ids = []
+        self.deviation_subjects = {}  # sid -> reason
         self.study_refs = []
         self.n_total = 0
         self.n_completed = 0
         self.n_included = 0
+        self.randomization_groups = {}
+        self.needs_unrandomization = False
+        self.randomization_source = ""
 
 
 # ═══════════════════════════════════════════════════════════════
-# 3. PARSING LOGIC
+# 3. CONFIG IMPORT — Load VBA-exported JSON
+# ═══════════════════════════════════════════════════════════════
+
+def load_config_from_json(json_bytes):
+    """Parse VBA-exported JSON config into TimepointData objects."""
+    config = json.loads(json_bytes)
+    settings = config.get("settings", {})
+    tp_configs = config.get("timepoints", [])
+
+    timepoints = []
+    for tp_cfg in tp_configs:
+        tp = TimepointData(
+            name=tp_cfg["name"],
+            sheet_name=tp_cfg["sheet_name"],
+            file_path=tp_cfg.get("file_path", ""),
+        )
+        tp.study_refs = tp_cfg.get("study_refs", [])
+        tp.n_total = int(tp_cfg.get("total_rows", 0))
+        tp.n_completed = int(tp_cfg.get("completed_rows", 0))
+        tp.dropped_ids = tp_cfg.get("excluded_subjects", [])
+        tp.deviation_subjects = tp_cfg.get("deviation_subjects", {})
+        tp.needs_unrandomization = tp_cfg.get("needs_unrandomization", False)
+        tp.randomization_source = tp_cfg.get("randomization_source", "")
+        tp.randomization_groups = tp_cfg.get("randomization_groups", {})
+
+        for q_cfg in tp_cfg.get("questions", []):
+            levels = {}
+            for k, v in q_cfg.get("levels", {}).items():
+                try:
+                    levels[int(k)] = v
+                except ValueError:
+                    pass
+
+            qi = QuestionInfo(
+                var_name=q_cfg["var_name"],
+                question_text=q_cfg.get("question_text", ""),
+                col_index=int(q_cfg.get("col_index", 0)),
+                levels=levels,
+            )
+            qi.is_multi_select = q_cfg.get("is_multi_select", False)
+
+            # Parse favorable mask from VBA format "1,2,3" or "(none)"
+            fav_raw = q_cfg.get("fav_mask", "(none)")
+            if fav_raw in ("(none)", "(multi-select)", ""):
+                qi.fav_mask = []
+            else:
+                qi.fav_mask = [int(x.strip()) for x in fav_raw.split(",") if x.strip().isdigit()]
+
+            # Parse neutral mask
+            neutral_raw = q_cfg.get("neutral_mask", "(none)")
+            if neutral_raw not in ("(none)", ""):
+                try:
+                    qi.neutral_mask = int(neutral_raw)
+                except ValueError:
+                    qi.neutral_mask = None
+
+            tp.questions.append(qi)
+
+        timepoints.append(tp)
+
+    return config, settings, timepoints
+
+
+def compute_n_included_from_config(tp, settings):
+    """
+    Replicate VBA UpdateIncludedLabel logic:
+    n = total (or completed if completed_only) - excluded - deviation(NoData/EXCLUDE_N)
+    """
+    completed_only = settings.get("completed_only", False)
+    n = tp.n_completed if completed_only else tp.n_total
+
+    n -= len(tp.dropped_ids)
+
+    for sid, reason in tp.deviation_subjects.items():
+        if "No Data" in reason or reason.startswith("[EXCLUDE_N]"):
+            n -= 1
+
+    return max(n, 0)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 4. PARSING LOGIC (Manual Workflow — unchanged from v8)
 # ═══════════════════════════════════════════════════════════════
 
 def detect_questionnaire_sheets(excel_path):
@@ -236,6 +330,7 @@ def load_timepoint(excel_path, sheet_name, ov_sheet_name, global_exclusions):
 
 
 def compute_stats(tp, q):
+    """Compute stats for manual-workflow timepoints (have subject_data)."""
     if not q.is_scaled: return None
     df = tp.subject_data[tp.subject_data['_SID'].isin(tp.included_subjects)]
     counts = {k: 0 for k in q.levels.keys()}
@@ -252,8 +347,131 @@ def compute_stats(tp, q):
     }
 
 
+def compute_stats_from_config(tp, q, excel_path, settings):
+    """
+    Compute stats for config-loaded timepoints by reading the actual workbook
+    but applying the finalized masks/exclusions from the config.
+    """
+    if not q.is_scaled or q.is_multi_select:
+        return None
+
+    try:
+        df_raw = pd.read_excel(excel_path, sheet_name=tp.sheet_name, header=None)
+    except Exception:
+        return None
+
+    headers = [str(v).strip() for v in df_raw.iloc[0]]
+    df_data = df_raw.iloc[2:].copy()
+    df_data.columns = headers
+    df_data = df_data.reset_index(drop=True)
+
+    c_subj = next((h for h in headers if h.upper() == COL_SUBJECT), None)
+    c_stat = next((h for h in headers if h.upper() == COL_STATUS), None)
+    c_cent = next((h for h in headers if h.upper() == COL_CENTER), None)
+
+    if not c_subj:
+        return None
+
+    def fmt_sid(v):
+        try: return f"{int(float(v)):04d}"
+        except: return str(v).strip()
+
+    df_data['_SID'] = df_data[c_subj].apply(fmt_sid)
+
+    # Apply center filter
+    center = settings.get("center_filter", CENTER_FILTER)
+    if c_cent:
+        df_data = df_data[df_data[c_cent].astype(str).str.upper().str.strip() == center]
+
+    # Apply exclusions
+    excluded = set(tp.dropped_ids)
+    df_data = df_data[~df_data['_SID'].isin(excluded)]
+
+    # Apply deviation exclusions (No Data / EXCLUDE_N)
+    dev_exclude = set()
+    for sid, reason in tp.deviation_subjects.items():
+        if "No Data" in reason or reason.startswith("[EXCLUDE_N]"):
+            dev_exclude.add(sid)
+    df_data = df_data[~df_data['_SID'].isin(dev_exclude)]
+
+    # Completed only filter
+    if settings.get("completed_only", False) and c_stat:
+        df_data = df_data[df_data[c_stat].astype(str).str.upper().str.strip() == "COMPLETED"]
+
+    n = len(df_data)
+    if n == 0:
+        return {'level_pcts': {}, 'fav_pct': 0, 'unfav_pct': 100, 'n': 0}
+
+    # Find the column for this variable
+    var_col = None
+    for h in headers:
+        norm_h = re.sub(r'_1$', '', h)
+        if h == q.var_name or norm_h == q.var_name:
+            var_col = h
+            break
+
+    if var_col is None:
+        return None
+
+    counts = {k: 0 for k in q.levels.keys()}
+    for val in df_data[var_col]:
+        try:
+            v = int(float(val))
+            if v in counts:
+                counts[v] += 1
+        except:
+            pass
+
+    # Handle split-neutral
+    split_neutral = settings.get("split_neutral", False)
+    display_counts = dict(counts)
+
+    if split_neutral and q.neutral_mask is not None:
+        neutral_idx = q.neutral_mask
+        if neutral_idx in counts and counts[neutral_idx] > 0:
+            neutral_total = counts[neutral_idx]
+            to_agree = neutral_total // 2
+            to_disagree = neutral_total - to_agree
+
+            # Find agree target (highest fav index that isn't neutral)
+            agree_target = None
+            for idx in sorted(q.fav_mask, reverse=True):
+                if idx != neutral_idx:
+                    agree_target = idx
+                    break
+
+            # Find disagree target (lowest non-fav, non-neutral)
+            disagree_target = None
+            for idx in sorted(q.levels.keys()):
+                if idx not in q.fav_mask and idx != neutral_idx:
+                    disagree_target = idx
+                    break
+
+            if agree_target is not None:
+                display_counts[agree_target] = display_counts.get(agree_target, 0) + to_agree
+            if disagree_target is not None:
+                display_counts[disagree_target] = display_counts.get(disagree_target, 0) + to_disagree
+            display_counts[neutral_idx] = 0
+
+    # Favorable calculation (uses original counts for strict fav, adds neutral split)
+    strict_fav = sum(counts.get(k, 0) for k in q.fav_mask)
+    neutral_contribution = 0
+    if split_neutral and q.neutral_mask is not None and q.neutral_mask in counts:
+        neutral_contribution = counts[q.neutral_mask] // 2
+    total_fav = strict_fav + neutral_contribution
+
+    fav_pct = (total_fav / n * 100) if n else 0
+
+    return {
+        'level_pcts': {k: (v / n * 100 if n else 0) for k, v in display_counts.items()},
+        'fav_pct': fav_pct,
+        'unfav_pct': 100 - fav_pct,
+        'n': n
+    }
+
+
 # ═══════════════════════════════════════════════════════════════
-# 4. TITLE CLEANING
+# 5. TITLE CLEANING
 # ═══════════════════════════════════════════════════════════════
 
 def build_chart_title(tp, text, is_topline):
@@ -273,7 +491,7 @@ def clean_chart_title(chart_id, suggested_title):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 5. CHART GENERATION
+# 6. CHART GENERATION (unchanged from v8)
 # ═══════════════════════════════════════════════════════════════
 
 def make_bars_rounded(ax, pad=0.1, rounding_size=0.3):
@@ -291,28 +509,31 @@ def make_bars_rounded(ax, pad=0.1, rounding_size=0.3):
     for patch in new_patches: ax.add_patch(patch)
 
 
-def create_dashboard_page(tp, all_stats, is_topline, custom_title=None):
-    scaled_qs = [q for q in tp.questions if q.is_scaled and q.var_name in all_stats]
+def create_dashboard_page(tp, all_stats, is_topline, threshold_pct, custom_title=None):
+    scaled_qs = [q for q in tp.questions if q.is_scaled and not q.is_multi_select and q.var_name in all_stats]
     if not scaled_qs: return None
 
     fav_vals = [all_stats[q.var_name]['fav_pct'] for q in scaled_qs]
     avg_fav = np.mean(fav_vals) if fav_vals else 0
-    thresh_val = FAVORABLE_THRESHOLD * 100
+    thresh_val = threshold_pct
+
+    n_included = all_stats[scaled_qs[0].var_name]['n'] if scaled_qs else tp.n_included
 
     fig = plt.figure(figsize=(11, 8.5))
     fig.patch.set_facecolor('white')
 
     title = custom_title if custom_title else build_chart_title(tp, "Summary", is_topline)
     fig.text(0.05, 0.92, title, fontsize=18, weight='bold', color=COLORS['text_main'])
-    fig.text(0.05, 0.88, f"Center: {CENTER_FILTER} | n={tp.n_included} Included Subjects",
+    fig.text(0.05, 0.88, f"Center: {CENTER_FILTER} | n={n_included} Included Subjects",
              fontsize=11, color=COLORS['text_sub'])
 
+    total_enrolled = tp.n_total + len(tp.dropped_ids)
     cards = [
-        {'label': 'Total Enrolled', 'val': str(tp.n_total + len(tp.dropped_ids)),
+        {'label': 'Total Enrolled', 'val': str(total_enrolled),
          'sub': 'VCS Center', 'x': 0.05, 'c': COLORS['favorable']},
         {'label': 'Completed', 'val': str(tp.n_completed),
-         'sub': f'{(tp.n_completed / (tp.n_total + len(tp.dropped_ids)) * 100):.1f}% Rate', 'x': 0.29,
-         'c': COLORS['excellent']},
+         'sub': f'{(tp.n_completed / total_enrolled * 100):.1f}% Rate' if total_enrolled else '—',
+         'x': 0.29, 'c': COLORS['excellent']},
         {'label': 'Avg Favorable', 'val': f"{avg_fav:.1f}%", 'sub': 'All Questions', 'x': 0.53,
          'c': COLORS['text_main']},
         {'label': f'Questions >{int(thresh_val)}%',
@@ -344,21 +565,20 @@ def create_dashboard_page(tp, all_stats, is_topline, custom_title=None):
 
     bars = ax.bar(x_pos, vals, color=colors, width=0.6, alpha=0.9)
     make_bars_rounded(ax, pad=0.05, rounding_size=0.2)
-
     ax.set_xticks(x_pos)
     ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
     ax.set_ylabel("Favorable Response (%)")
     ax.set_ylim(0, 105)
 
-    z = np.polyfit(x_pos, vals, 1)
-    p = np.poly1d(z)
-    ax.plot(x_pos, p(x_pos), color=COLORS['trendline'], linestyle='-', linewidth=2, label='Trendline')
+    if len(x_pos) > 1:
+        z = np.polyfit(x_pos, vals, 1)
+        p = np.poly1d(z)
+        ax.plot(x_pos, p(x_pos), color=COLORS['trendline'], linestyle='-', linewidth=2, label='Trendline')
     ax.axhline(thresh_val, color=COLORS['neutral'], linestyle='--', alpha=0.5, linewidth=1)
     ax.legend(loc='upper left', frameon=False, fontsize=9)
 
-    all_present_ids = set(tp.subject_data['_SID'])
-    inc_ids = set(tp.included_subjects)
-    excluded = sorted(list((all_present_ids - inc_ids) | set(tp.dropped_ids)))
+    # Excluded subjects footer (dropped only, no deviation details)
+    excluded = sorted(set(tp.dropped_ids))
 
     if excluded:
         drop_str = ", ".join(excluded)
@@ -369,19 +589,19 @@ def create_dashboard_page(tp, all_stats, is_topline, custom_title=None):
     else:
         fig.text(0.05, 0.05, "No subjects excluded from analysis.",
                  fontsize=9, color=COLORS['excellent'])
-
     return fig
 
 
-def create_ranked_chart(tp, all_stats, is_topline, custom_title=None):
-    scaled_qs = [q for q in tp.questions if q.is_scaled and q.var_name in all_stats]
+def create_ranked_chart(tp, all_stats, is_topline, threshold_pct, custom_title=None):
+    scaled_qs = [q for q in tp.questions if q.is_scaled and not q.is_multi_select and q.var_name in all_stats]
     sorted_qs = sorted(scaled_qs, key=lambda q: all_stats[q.var_name]['fav_pct'], reverse=False)
     n_qs = len(sorted_qs)
+    if n_qs == 0: return None
 
     fig, ax = plt.subplots(figsize=(11, max(6, n_qs * 0.4 + 2)))
     labels = [f"Q{q.q_number}" for q in sorted_qs]
     vals = [all_stats[q.var_name]['fav_pct'] for q in sorted_qs]
-    colors = [COLORS['excellent'] if v >= FAVORABLE_THRESHOLD * 100 else COLORS['warning'] for v in vals]
+    colors = [COLORS['excellent'] if v >= threshold_pct else COLORS['warning'] for v in vals]
 
     ax.barh(np.arange(n_qs), vals, color=colors, height=0.6)
     make_bars_rounded(ax)
@@ -391,18 +611,18 @@ def create_ranked_chart(tp, all_stats, is_topline, custom_title=None):
 
     title = custom_title if custom_title else build_chart_title(tp, "Ranked Performance", is_topline)
     ax.set_title(title, fontsize=14, weight='bold', loc='left')
-
-    ax.axvline(FAVORABLE_THRESHOLD * 100, color=COLORS['excellent'], linestyle='--', linewidth=1)
+    ax.axvline(threshold_pct, color=COLORS['excellent'], linestyle='--', linewidth=1)
     for i, v in enumerate(vals):
         ax.text(v + 1, i, f"{v:.1f}%", va='center', fontsize=9)
-
     plt.tight_layout()
     return fig
 
 
 def create_detailed_bars(tp, all_stats, is_topline, custom_title=None):
-    scaled_qs = [q for q in tp.questions if q.is_scaled and q.var_name in all_stats]
+    scaled_qs = [q for q in tp.questions if q.is_scaled and not q.is_multi_select and q.var_name in all_stats]
     sorted_qs = sorted(scaled_qs, key=lambda q: all_stats[q.var_name]['fav_pct'], reverse=False)
+    if not sorted_qs: return None
+
     fig, ax = plt.subplots(figsize=(12, max(6, len(sorted_qs) * 0.4 + 2)))
     for i, q in enumerate(sorted_qs):
         stats = all_stats[q.var_name]
@@ -430,19 +650,19 @@ def create_detailed_bars(tp, all_stats, is_topline, custom_title=None):
 
 
 def create_diverging_chart(tp, all_stats, is_topline, custom_title=None):
-    scaled_qs = [q for q in tp.questions if q.is_scaled and q.var_name in all_stats]
+    scaled_qs = [q for q in tp.questions if q.is_scaled and not q.is_multi_select and q.var_name in all_stats]
     sorted_qs = sorted(scaled_qs, key=lambda q: all_stats[q.var_name]['fav_pct'], reverse=False)
     n_qs = len(sorted_qs)
+    if n_qs == 0: return None
+
     fig, ax = plt.subplots(figsize=(11, max(6, n_qs * 0.4 + 2)))
     y = np.arange(n_qs)
-
     favs = [all_stats[q.var_name]['fav_pct'] for q in sorted_qs]
     unfavs = [-all_stats[q.var_name]['unfav_pct'] for q in sorted_qs]
     labels = [f"Q{q.q_number}" for q in sorted_qs]
 
     ax.barh(y, favs, color=COLORS['favorable'], height=0.6, label='Favorable')
     ax.barh(y, unfavs, color=COLORS['unfavorable'], height=0.6, label='Unfavorable')
-
     make_bars_rounded(ax)
     ax.axvline(0, color='black', linewidth=0.8)
     ax.set_yticks(y)
@@ -450,11 +670,9 @@ def create_diverging_chart(tp, all_stats, is_topline, custom_title=None):
 
     title = custom_title if custom_title else build_chart_title(tp, "Diverging View", is_topline)
     ax.set_title(title, fontsize=14, weight='bold', loc='left')
-
     ax.set_xlim(-100, 100)
     ax.set_xticks([-100, -50, 0, 50, 100])
     ax.set_xticklabels(['100', '50', '0', '50', '100'])
-
     plt.tight_layout()
     return fig
 
@@ -465,11 +683,13 @@ def create_comparison_page(timepoints, all_tp_stats):
     tp_q_map = {}
     for tp in timepoints:
         q_map = {q.q_number: all_tp_stats[tp.name][q.var_name]['fav_pct']
-                 for q in tp.questions if q.is_scaled}
+                 for q in tp.questions if q.is_scaled and not q.is_multi_select
+                 and q.var_name in all_tp_stats.get(tp.name, {})}
         tp_q_map[tp.name] = q_map
         common = set(q_map.keys()) if common is None else common & set(q_map.keys())
     if not common: return None
     sorted_qs = sorted(common, key=lambda x: (len(x), x))
+
     fig, ax = plt.subplots(figsize=(16, max(6, len(sorted_qs) * 0.5 + 2)))
     x = np.arange(len(sorted_qs))
     width = 0.8 / len(timepoints)
@@ -487,20 +707,18 @@ def create_comparison_page(timepoints, all_tp_stats):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 6. STREAMLIT APP
+# 7. STREAMLIT APP
 # ═══════════════════════════════════════════════════════════════
 
 def init_session_state():
-    """Initialize all session state variables."""
     defaults = {
         'step': 0,
         'timepoints': [],
         'all_tp_stats': {},
         'chart_titles': {},
         'file_processed': False,
-        'scales_confirmed': False,
-        'subjects_confirmed': False,
-        'titles_confirmed': False,
+        'config_loaded': False,
+        'config_settings': {},
         'pdf_bytes': None,
         'pdf_name': '',
     }
@@ -509,24 +727,29 @@ def init_session_state():
             st.session_state[k] = v
 
 
-def go_to_step(n):
-    st.session_state.step = n
-
-
 def render_sidebar():
-    """Render the step navigation sidebar."""
     with st.sidebar:
-        st.markdown("## 📊 ePRO Chart Gen v8")
-        st.caption("Streamlit Edition")
+        st.markdown("## 📊 ePRO Chart Gen v9")
+        st.caption("Config-Aware Edition")
         st.divider()
 
-        steps = [
-            "1️⃣ Upload & Configure",
-            "2️⃣ Verify Scales",
-            "3️⃣ Subject Inclusion",
-            "4️⃣ Review Titles",
-            "5️⃣ Generate PDF",
-        ]
+        if st.session_state.config_loaded:
+            st.success("Config loaded")
+            steps = [
+                "1️⃣ Upload & Configure",
+                "2️⃣ Review & Generate",
+            ]
+            max_step = 1
+        else:
+            steps = [
+                "1️⃣ Upload & Configure",
+                "2️⃣ Verify Scales",
+                "3️⃣ Subject Inclusion",
+                "4️⃣ Review Titles",
+                "5️⃣ Generate PDF",
+            ]
+            max_step = 4
+
         for i, label in enumerate(steps):
             disabled = i > st.session_state.step + 1
             if st.sidebar.button(label, key=f"nav_{i}", disabled=disabled, use_container_width=True):
@@ -535,82 +758,249 @@ def render_sidebar():
 
 
 def step_upload():
-    """Step 1: File upload and configuration."""
-    st.header("📁 Upload & Configure")
-    st.caption("Upload your ePRO workbook and set analysis options.")
+    st.header("Upload & Configure")
 
-    uploaded = st.file_uploader("Upload ePRO Workbook", type=["xlsx", "xls"])
+    mode = st.radio("Workflow Mode", ["Import Config (from Excel UserForm)", "Manual (parse workbook)"],
+                    horizontal=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        is_topline = st.toggle("TopLine Report", value=False)
-    with col2:
-        exclusions_str = st.text_input("Global Subject Exclusions", placeholder="e.g. 0042, 0091",
-                                       help="These subjects will be excluded from ALL timepoints")
+    if mode.startswith("📄"):
+        st.subheader("Import VBA Config")
+        st.caption("Upload the JSON config exported from the Excel ePRO UserForm. "
+                   "All scale decisions, exclusions, and masks are pre-loaded — you skip straight to charts.")
 
-    if uploaded and st.button("🔍 Process Workbook", type="primary"):
-        global_exclusions = [x.strip() for x in exclusions_str.split(',') if x.strip()] if exclusions_str else []
+        config_file = st.file_uploader("Upload config JSON", type=["json"])
+        workbook_file = st.file_uploader("Upload matching ePRO Workbook", type=["xlsx", "xls"],
+                                         help="The same workbook used in the Excel UserForm")
 
-        # Save uploaded file to temp
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
-            tmp.write(uploaded.read())
-            tmp_path = tmp.name
+        if config_file and workbook_file and st.button("🔗 Load Config + Data", type="primary"):
+            with st.spinner("Loading configuration..."):
+                config, settings, timepoints = load_config_from_json(config_file.read())
 
-        with st.spinner("Reading workbook..."):
-            sheets = detect_questionnaire_sheets(tmp_path)
-            if not sheets:
-                st.error("No questionnaire sheets found in workbook.")
-                os.unlink(tmp_path)
-                return
+                # Save workbook to temp
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+                    tmp.write(workbook_file.read())
+                    tmp_path = tmp.name
 
-            timepoints = []
-            all_tp_stats = {}
+                # Compute stats from actual data using config masks
+                all_tp_stats = {}
+                for tp in timepoints:
+                    tp.n_included = compute_n_included_from_config(tp, settings)
+                    stats = {}
+                    for q in tp.questions:
+                        if q.is_scaled and not q.is_multi_select:
+                            s = compute_stats_from_config(tp, q, tmp_path, settings)
+                            if s:
+                                stats[q.var_name] = s
+                    all_tp_stats[tp.name] = stats
 
-            for sheet_name, _ in sheets:
-                ov = find_option_values_sheet(tmp_path, sheet_name)
-                if not ov: continue
-                tp = load_timepoint(tmp_path, sheet_name, ov, global_exclusions)
-                if not tp: continue
+                # Build chart titles
+                is_topline = settings.get("is_topline", False)
+                chart_titles = {}
+                for tp in timepoints:
+                    for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance'),
+                                         ('diverging', 'Diverging View')]:
+                        chart_id = f"{tp.name}_{suffix}"
+                        raw_title = build_chart_title(tp, text, is_topline)
+                        chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
 
-                stats = {}
-                for q in tp.questions:
-                    if q.is_scaled:
-                        stats[q.var_name] = compute_stats(tp, q)
+                    # Per-group charts if randomized
+                    if tp.needs_unrandomization and tp.randomization_groups:
+                        for grp_name in tp.randomization_groups:
+                            for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance'),
+                                                 ('diverging', 'Diverging View')]:
+                                chart_id = f"{tp.name}_{grp_name}_{suffix}"
+                                raw_title = build_chart_title(tp, f"{grp_name} {text}", is_topline)
+                                chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
 
-                timepoints.append(tp)
-                all_tp_stats[tp.name] = stats
+                st.session_state.timepoints = timepoints
+                st.session_state.all_tp_stats = all_tp_stats
+                st.session_state.chart_titles = chart_titles
+                st.session_state.config_loaded = True
+                st.session_state.config_settings = settings
+                st.session_state.is_topline = is_topline
+                st.session_state.tmp_path = tmp_path
+                st.session_state.file_processed = True
+                st.session_state.pdf_name = f"{Path(workbook_file.name).stem}{'_TPL' if is_topline else ''}_Charts_v9.pdf"
+                st.session_state.step = 1
+                st.rerun()
 
-            if not timepoints:
-                st.error("No valid timepoints found.")
-                os.unlink(tmp_path)
-                return
+    else:
+        # === MANUAL WORKFLOW (same as v8) ===
+        st.subheader("Manual Workbook Import")
+        uploaded = st.file_uploader("Upload ePRO Workbook", type=["xlsx", "xls"])
 
-            # Build chart titles
-            chart_titles = {}
-            for tp in timepoints:
-                for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance'),
-                                     ('detailed', 'Detailed Breakdown'), ('diverging', 'Diverging View')]:
-                    chart_id = f"{tp.name}_{suffix}"
-                    raw_title = build_chart_title(tp, text, is_topline)
-                    chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
+        col1, col2 = st.columns(2)
+        with col1:
+            is_topline = st.toggle("TopLine Report", value=False)
+        with col2:
+            exclusions_str = st.text_input("Global Subject Exclusions", placeholder="e.g. 0042, 0091")
 
-            # Save to session
-            st.session_state.timepoints = timepoints
-            st.session_state.all_tp_stats = all_tp_stats
-            st.session_state.chart_titles = chart_titles
-            st.session_state.is_topline = is_topline
-            st.session_state.tmp_path = tmp_path
-            st.session_state.file_processed = True
-            st.session_state.pdf_name = f"{Path(uploaded.name).stem}{'_TPL' if is_topline else ''}_Charts_v8.pdf"
-            st.session_state.step = 1
+        if uploaded and st.button("🔍 Process Workbook", type="primary"):
+            global_exclusions = [x.strip() for x in exclusions_str.split(',') if x.strip()] if exclusions_str else []
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+                tmp.write(uploaded.read())
+                tmp_path = tmp.name
+
+            with st.spinner("Reading workbook..."):
+                sheets = detect_questionnaire_sheets(tmp_path)
+                if not sheets:
+                    st.error("No questionnaire sheets found.")
+                    os.unlink(tmp_path)
+                    return
+
+                timepoints = []
+                all_tp_stats = {}
+                for sheet_name, _ in sheets:
+                    ov = find_option_values_sheet(tmp_path, sheet_name)
+                    if not ov: continue
+                    tp = load_timepoint(tmp_path, sheet_name, ov, global_exclusions)
+                    if not tp: continue
+                    stats = {}
+                    for q in tp.questions:
+                        if q.is_scaled:
+                            stats[q.var_name] = compute_stats(tp, q)
+                    timepoints.append(tp)
+                    all_tp_stats[tp.name] = stats
+
+                if not timepoints:
+                    st.error("No valid timepoints found.")
+                    os.unlink(tmp_path)
+                    return
+
+                chart_titles = {}
+                for tp in timepoints:
+                    for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance'),
+                                         ('diverging', 'Diverging View')]:
+                        chart_id = f"{tp.name}_{suffix}"
+                        raw_title = build_chart_title(tp, text, is_topline)
+                        chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
+
+                st.session_state.timepoints = timepoints
+                st.session_state.all_tp_stats = all_tp_stats
+                st.session_state.chart_titles = chart_titles
+                st.session_state.is_topline = is_topline
+                st.session_state.tmp_path = tmp_path
+                st.session_state.file_processed = True
+                st.session_state.config_loaded = False
+                st.session_state.config_settings = {}
+                st.session_state.pdf_name = f"{Path(uploaded.name).stem}{'_TPL' if is_topline else ''}_Charts_v9.pdf"
+                st.session_state.step = 1
+                st.rerun()
+
+
+def step_config_review_and_generate():
+    """Combined review + generate for config-loaded workflow."""
+    st.header("Review & Generate")
+
+    timepoints = st.session_state.timepoints
+    all_tp_stats = st.session_state.all_tp_stats
+    titles = st.session_state.chart_titles
+    settings = st.session_state.config_settings
+    is_topline = settings.get("is_topline", False)
+    threshold = settings.get("favorable_threshold", 0.70)
+    threshold_pct = threshold * 100
+
+    # Config summary
+    st.subheader("Imported Configuration")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Timepoints", len(timepoints))
+    col2.metric("Threshold", f"{threshold_pct:.0f}%")
+    col3.metric("Completed Only", "Yes" if settings.get("completed_only") else "No")
+    col4.metric("Split Neutral", "Yes" if settings.get("split_neutral") else "No")
+
+    # Timepoint detail cards
+    for tp in timepoints:
+        tp_stats = all_tp_stats.get(tp.name, {})
+        n_val = tp_stats[next(iter(tp_stats))]['n'] if tp_stats else tp.n_included
+        scaled_count = sum(1 for q in tp.questions if q.is_scaled and not q.is_multi_select)
+
+        with st.expander(f"{tp.name} — n={n_val}, {scaled_count} scaled questions", expanded=False):
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total VCS", tp.n_total)
+            c2.metric("Excluded", len(tp.dropped_ids))
+            c3.metric("Deviations", len(tp.deviation_subjects))
+
+            if tp.dropped_ids:
+                st.caption(f"Dropped: {', '.join(sorted(tp.dropped_ids))}")
+            if tp.deviation_subjects:
+                for sid, reason in sorted(tp.deviation_subjects.items()):
+                    display_reason = reason.replace("[EXCLUDE_N]", "")
+                    st.caption(f"  {sid}: {display_reason}")
+
+            if tp.needs_unrandomization:
+                st.info(f"Randomization: {tp.randomization_source} — "
+                        f"{len(tp.randomization_groups)} group(s)")
+
+    st.divider()
+
+    # Editable titles
+    st.subheader("Chart Titles")
+    updated_titles = {}
+    for chart_id, title in titles.items():
+        new_title = st.text_input(chart_id, value=title, key=f"title_{chart_id}")
+        updated_titles[chart_id] = new_title
+    st.session_state.chart_titles = updated_titles
+
+    st.divider()
+
+    # Generate
+    if st.session_state.pdf_bytes:
+        st.success("PDF generated successfully!")
+        st.download_button("Download PDF", data=st.session_state.pdf_bytes,
+                           file_name=st.session_state.pdf_name, mime="application/pdf", type="primary")
+        if st.button("🔄 Regenerate"):
+            st.session_state.pdf_bytes = None
             st.rerun()
+        return
 
+    if st.button("Generate PDF", type="primary"):
+        _generate_pdf(timepoints, all_tp_stats, updated_titles, is_topline, threshold_pct)
+
+
+def _generate_pdf(timepoints, all_tp_stats, titles, is_topline, threshold_pct):
+    pdf_buffer = BytesIO()
+    progress = st.progress(0, text="Generating charts...")
+    total = len(timepoints) * 3 + (1 if len(timepoints) >= 2 else 0)
+    chart_count = 0
+
+    with PdfPages(pdf_buffer) as pdf:
+        for tp in timepoints:
+            stats = all_tp_stats.get(tp.name, {})
+
+            fig = create_dashboard_page(tp, stats, is_topline, threshold_pct,
+                                        custom_title=titles.get(f"{tp.name}_dashboard"))
+            if fig: pdf.savefig(fig); plt.close(fig)
+            chart_count += 1
+            progress.progress(chart_count / total, text=f"{tp.name} dashboard...")
+
+            fig = create_ranked_chart(tp, stats, is_topline, threshold_pct,
+                                      custom_title=titles.get(f"{tp.name}_ranked"))
+            if fig: pdf.savefig(fig); plt.close(fig)
+            chart_count += 1
+            progress.progress(chart_count / total, text=f"{tp.name} ranked...")
+
+            fig = create_diverging_chart(tp, stats, is_topline,
+                                         custom_title=titles.get(f"{tp.name}_diverging"))
+            if fig: pdf.savefig(fig); plt.close(fig)
+            chart_count += 1
+            progress.progress(chart_count / total, text=f"{tp.name} diverging...")
+
+        if len(timepoints) >= 2:
+            fig = create_comparison_page(timepoints, all_tp_stats)
+            if fig: pdf.savefig(fig); plt.close(fig)
+
+    progress.progress(1.0, text="Done!")
+    st.session_state.pdf_bytes = pdf_buffer.getvalue()
+    st.rerun()
+
+
+# === Manual workflow steps (unchanged from v8) ===
 
 def step_scales():
-    """Step 2: Verify favorable logic."""
     st.header("⚖️ Verify Favorable Logic")
     st.caption("Review and adjust which response values count as 'favorable' for each scale group.")
-
     timepoints = st.session_state.timepoints
 
     for tp in timepoints:
@@ -622,11 +1012,8 @@ def step_scales():
         for sig, q_list in groups.items():
             ex_q = q_list[0]
             scale_str = " | ".join([f"**{k}**: {v}" for k, v in sorted(ex_q.levels.items())])
-
             with st.expander(f"Scale Group — {len(q_list)} questions", expanded=True):
                 st.markdown(f"**Scale:** {scale_str}")
-
-                # Show questions in this group
                 q_data = []
                 for q in q_list:
                     fav_str = ", ".join(map(str, q.fav_mask)) if q.fav_mask else "None"
@@ -634,211 +1021,126 @@ def step_scales():
                                    "Question": q.question_text[:80]})
                 st.dataframe(pd.DataFrame(q_data), use_container_width=True, hide_index=True)
 
-                # Edit favorable values
                 current_fav = ", ".join(map(str, ex_q.fav_mask))
                 key = f"fav_{tp.name}_{id(ex_q)}"
-                new_fav = st.text_input(f"Favorable values for this group", value=current_fav, key=key,
-                                        help="Comma-separated values, e.g. 4, 5")
-
-                # Parse and apply
+                new_fav = st.text_input(f"Favorable values for this group", value=current_fav, key=key)
                 try:
                     parsed = [int(x.strip()) for x in new_fav.split(',') if x.strip()]
                     valid = [p for p in parsed if p in ex_q.levels]
                     if valid:
-                        for q in q_list:
-                            q.fav_mask = valid
-                except:
-                    pass
+                        for q in q_list: q.fav_mask = valid
+                except: pass
 
-    if st.button("✅ Confirm Scales", type="primary"):
-        # Recompute stats with updated masks
+    if st.button("Confirm Scales", type="primary"):
         for tp in st.session_state.timepoints:
             stats = {}
             for q in tp.questions:
-                if q.is_scaled:
-                    stats[q.var_name] = compute_stats(tp, q)
+                if q.is_scaled: stats[q.var_name] = compute_stats(tp, q)
             st.session_state.all_tp_stats[tp.name] = stats
-
-        st.session_state.scales_confirmed = True
         st.session_state.step = 2
         st.rerun()
 
 
 def step_subjects():
-    """Step 3: Subject inclusion."""
-    st.header("👥 Subject Inclusion")
-    st.caption("Review non-completed subjects and optionally include them in the analysis.")
-
+    st.header("Subject Inclusion")
     timepoints = st.session_state.timepoints
     any_non_completed = False
 
     for tp in timepoints:
         if not tp.non_completed: continue
         any_non_completed = True
-
-        st.subheader(f"📋 {tp.name}")
+        st.subheader(f"{tp.name}")
         st.markdown(f"**Completed:** {tp.n_completed} / {tp.n_total}")
 
         non_comp_with_data = [s for s in tp.non_completed if s['coverage_pct'] > 0]
         if not non_comp_with_data:
-            st.info("No non-completed subjects with data to include.")
+            st.info("No non-completed subjects with data.")
             continue
 
         for s in sorted(non_comp_with_data, key=lambda x: x['sid']):
             col1, col2, col3, col4 = st.columns([1, 2, 2, 3])
             key = f"inc_{tp.name}_{s['sid']}"
-            with col1:
-                include = st.checkbox("Include", key=key, value=False)
-            with col2:
-                st.markdown(f"**{s['sid']}**")
-            with col3:
-                st.caption(s['status'])
-            with col4:
-                st.progress(s['coverage_pct'] / 100, text=f"{s['coverage_pct']:.0f}% data")
-
+            with col1: include = st.checkbox("Include", key=key, value=False)
+            with col2: st.markdown(f"**{s['sid']}**")
+            with col3: st.caption(s['status'])
+            with col4: st.progress(s['coverage_pct'] / 100, text=f"{s['coverage_pct']:.0f}% data")
             if include and s['sid'] not in tp.included_subjects:
                 tp.included_subjects.append(s['sid'])
                 tp.n_included = len(tp.included_subjects)
 
     if not any_non_completed:
-        st.success("All subjects across all timepoints are completed. Nothing to review here.")
+        st.success("All subjects completed across all timepoints.")
 
-    if st.button("✅ Confirm Subjects", type="primary"):
-        # Recompute stats with updated inclusions
+    if st.button("Confirm Subjects", type="primary"):
         for tp in st.session_state.timepoints:
             stats = {}
             for q in tp.questions:
-                if q.is_scaled:
-                    stats[q.var_name] = compute_stats(tp, q)
+                if q.is_scaled: stats[q.var_name] = compute_stats(tp, q)
             st.session_state.all_tp_stats[tp.name] = stats
-
-        st.session_state.subjects_confirmed = True
         st.session_state.step = 3
         st.rerun()
 
 
 def step_titles():
-    """Step 4: Review and edit chart titles."""
-    st.header("✏️ Review Chart Titles")
-    st.caption("Auto-cleaned titles are shown below. Edit any that need adjustment.")
-
+    st.header("Review Chart Titles")
     titles = st.session_state.chart_titles
     updated = {}
-
     for chart_id, title in titles.items():
         new_title = st.text_input(chart_id, value=title, key=f"title_{chart_id}")
         updated[chart_id] = new_title
 
-    if st.button("✅ Confirm Titles", type="primary"):
+    if st.button("Confirm Titles", type="primary"):
         st.session_state.chart_titles = updated
-        st.session_state.titles_confirmed = True
         st.session_state.step = 4
         st.rerun()
 
 
-def step_generate():
-    """Step 5: Generate and download PDF."""
-    st.header("🚀 Generate PDF")
-
+def step_generate_manual():
+    st.header("Generate PDF")
     timepoints = st.session_state.timepoints
     all_tp_stats = st.session_state.all_tp_stats
     titles = st.session_state.chart_titles
     is_topline = st.session_state.get('is_topline', False)
-
-    # Summary cards
-    total_charts = len(titles)
-    total_subjects = sum(tp.n_included for tp in timepoints)
+    threshold_pct = FAVORABLE_THRESHOLD * 100
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Timepoints", len(timepoints))
-    col2.metric("Total Charts", total_charts)
-    col3.metric("Included Subjects", total_subjects)
+    col2.metric("Total Charts", len(titles))
+    col3.metric("Included Subjects", sum(tp.n_included for tp in timepoints))
     col4.metric("Center", CENTER_FILTER)
 
-    st.divider()
-
-    # Show timepoint summaries
-    with st.expander("📊 Timepoint Details"):
-        for tp in timepoints:
-            st.markdown(f"**{tp.name}** — {tp.n_included} included, "
-                        f"{len(tp.dropped_ids)} dropped, {tp.n_completed} completed")
-
     if st.session_state.pdf_bytes:
-        st.success("✅ PDF generated successfully!")
-        st.download_button(
-            label="📥 Download PDF",
-            data=st.session_state.pdf_bytes,
-            file_name=st.session_state.pdf_name,
-            mime="application/pdf",
-            type="primary",
-        )
-        if st.button("🔄 Regenerate"):
+        st.success("PDF generated!")
+        st.download_button("Download PDF", data=st.session_state.pdf_bytes,
+                           file_name=st.session_state.pdf_name, mime="application/pdf", type="primary")
+        if st.button("Regenerate"):
             st.session_state.pdf_bytes = None
             st.rerun()
         return
 
-    if st.button("🚀 Generate PDF", type="primary"):
-        pdf_buffer = BytesIO()
-        progress = st.progress(0, text="Generating charts...")
-
-        with PdfPages(pdf_buffer) as pdf:
-            chart_count = 0
-            total = len(timepoints) * 4 + (1 if len(timepoints) >= 2 else 0)
-
-            for tp in timepoints:
-                stats = all_tp_stats[tp.name]
-
-                fig = create_dashboard_page(tp, stats, is_topline,
-                                            custom_title=titles.get(f"{tp.name}_dashboard"))
-                if fig: pdf.savefig(fig); plt.close(fig)
-                chart_count += 1
-                progress.progress(chart_count / total, text=f"Generating {tp.name} dashboard...")
-
-                fig = create_ranked_chart(tp, stats, is_topline,
-                                          custom_title=titles.get(f"{tp.name}_ranked"))
-                if fig: pdf.savefig(fig); plt.close(fig)
-                chart_count += 1
-                progress.progress(chart_count / total, text=f"Generating {tp.name} ranked...")
-
-                fig = create_detailed_bars(tp, stats, is_topline,
-                                           custom_title=titles.get(f"{tp.name}_detailed"))
-                if fig: pdf.savefig(fig); plt.close(fig)
-                chart_count += 1
-                progress.progress(chart_count / total, text=f"Generating {tp.name} detailed...")
-
-                fig = create_diverging_chart(tp, stats, is_topline,
-                                             custom_title=titles.get(f"{tp.name}_diverging"))
-                if fig: pdf.savefig(fig); plt.close(fig)
-                chart_count += 1
-                progress.progress(chart_count / total, text=f"Generating {tp.name} diverging...")
-
-            if len(timepoints) >= 2:
-                fig = create_comparison_page(timepoints, all_tp_stats)
-                if fig: pdf.savefig(fig); plt.close(fig)
-                chart_count += 1
-                progress.progress(1.0, text="Comparison chart complete!")
-
-        progress.progress(1.0, text="✅ Done!")
-        st.session_state.pdf_bytes = pdf_buffer.getvalue()
-        st.rerun()
+    if st.button("Generate PDF", type="primary"):
+        _generate_pdf(timepoints, all_tp_stats, titles, is_topline, threshold_pct)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7. MAIN APP ENTRY
+# 8. MAIN APP ENTRY
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    st.set_page_config(
-        page_title="ePRO Chart Generator v8",
-        page_icon="📊",
-        layout="wide",
-    )
+    st.set_page_config(page_title="ePRO Chart Generator v9", page_icon="📊", layout="wide")
 
     init_session_state()
     render_sidebar()
 
-    step_funcs = [step_upload, step_scales, step_subjects, step_titles, step_generate]
-    step_funcs[st.session_state.step]()
+    if st.session_state.config_loaded:
+        # Config workflow: Upload -> Review+Generate (2 steps)
+        step_funcs = [step_upload, step_config_review_and_generate]
+    else:
+        # Manual workflow: Upload -> Scales -> Subjects -> Titles -> Generate (5 steps)
+        step_funcs = [step_upload, step_scales, step_subjects, step_titles, step_generate_manual]
+
+    current = min(st.session_state.step, len(step_funcs) - 1)
+    step_funcs[current]()
 
 
 if __name__ == "__main__":
