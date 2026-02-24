@@ -29,6 +29,64 @@ import json
 # ═══════════════════════════════════════════════════════════════
 # 1. CONFIGURATION & STYLE
 # ═══════════════════════════════════════════════════════════════
+
+def load_config_from_json(json_bytes):
+    """
+    Parse VBA-exported JSON (or compatible text file) into TimepointData objects.
+    Accepts bytes from Streamlit file uploader.
+    """
+    # Decode bytes to string first
+    try:
+        json_str = json_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        # fallback for older or non-UTF-8 exports
+        json_str = json_bytes.decode('latin-1')
+
+    # Load JSON
+    config = json.loads(json_str)
+    settings = config.get("settings", {})
+    tp_configs = config.get("timepoints", [])
+
+    timepoints = []
+    for tp_cfg in tp_configs:
+        tp = TimepointData(
+            name=tp_cfg["name"],
+            sheet_name=tp_cfg["sheet_name"],
+            file_path=tp_cfg.get("file_path", ""),
+        )
+        tp.study_refs = tp_cfg.get("study_refs", [])
+        tp.n_total = int(tp_cfg.get("total_rows", 0))
+        tp.n_completed = int(tp_cfg.get("completed_rows", 0))
+        tp.dropped_ids = tp_cfg.get("excluded_subjects", [])
+        tp.deviation_subjects = tp_cfg.get("deviation_subjects", {})
+        tp.needs_unrandomization = tp_cfg.get("needs_unrandomization", False)
+        tp.randomization_source = tp_cfg.get("randomization_source", "")
+        tp.randomization_groups = tp_cfg.get("randomization_groups", {})
+
+        for q_cfg in tp_cfg.get("questions", []):
+            levels = {int(k): v for k, v in q_cfg.get("levels", {}).items() if k.isdigit()}
+            qi = QuestionInfo(
+                var_name=q_cfg["var_name"],
+                question_text=q_cfg.get("question_text", ""),
+                col_index=int(q_cfg.get("col_index", 0)),
+                levels=levels,
+            )
+            qi.is_multi_select = q_cfg.get("is_multi_select", False)
+
+            fav_raw = q_cfg.get("fav_mask", "(none)")
+            qi.fav_mask = [] if fav_raw in ("(none)", "(multi-select)", "") else [int(x) for x in fav_raw.split(",") if x.strip().isdigit()]
+
+            neutral_raw = q_cfg.get("neutral_mask", "(none)")
+            qi.neutral_mask = None
+            if neutral_raw not in ("(none)", ""):
+                try: qi.neutral_mask = int(neutral_raw)
+                except ValueError: pass
+
+            tp.questions.append(qi)
+        timepoints.append(tp)
+
+    return config, settings, timepoints
+
 FAVORABLE_THRESHOLD = 0.70
 CENTER_FILTER = "VCS"
 
@@ -818,7 +876,7 @@ def step_upload():
 
         col1, col2 = st.columns(2)
         with col1:
-            is_topline = st.toggle("TopLine Report", value=False)
+            is_topline = st.checkbox("TopLine Report", value=False)
         with col2:
             exclusions_str = st.text_input("Enter Dropped Subjects here", placeholder="e.g. 0042, 0091")
 
