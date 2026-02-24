@@ -648,35 +648,6 @@ def create_detailed_bars(tp, all_stats, is_topline, custom_title=None):
     plt.tight_layout()
     return fig
 
-
-def create_diverging_chart(tp, all_stats, is_topline, custom_title=None):
-    scaled_qs = [q for q in tp.questions if q.is_scaled and not q.is_multi_select and q.var_name in all_stats]
-    sorted_qs = sorted(scaled_qs, key=lambda q: all_stats[q.var_name]['fav_pct'], reverse=False)
-    n_qs = len(sorted_qs)
-    if n_qs == 0: return None
-
-    fig, ax = plt.subplots(figsize=(11, max(6, n_qs * 0.4 + 2)))
-    y = np.arange(n_qs)
-    favs = [all_stats[q.var_name]['fav_pct'] for q in sorted_qs]
-    unfavs = [-all_stats[q.var_name]['unfav_pct'] for q in sorted_qs]
-    labels = [f"Q{q.q_number}" for q in sorted_qs]
-
-    ax.barh(y, favs, color=COLORS['favorable'], height=0.6, label='Favorable')
-    ax.barh(y, unfavs, color=COLORS['unfavorable'], height=0.6, label='Unfavorable')
-    make_bars_rounded(ax)
-    ax.axvline(0, color='black', linewidth=0.8)
-    ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=10, weight='bold')
-
-    title = custom_title if custom_title else build_chart_title(tp, "Diverging View", is_topline)
-    ax.set_title(title, fontsize=14, weight='bold', loc='left')
-    ax.set_xlim(-100, 100)
-    ax.set_xticks([-100, -50, 0, 50, 100])
-    ax.set_xticklabels(['100', '50', '0', '50', '100'])
-    plt.tight_layout()
-    return fig
-
-
 def create_comparison_page(timepoints, all_tp_stats):
     if len(timepoints) < 2: return None
     common = None
@@ -797,8 +768,7 @@ def step_upload():
                 is_topline = settings.get("is_topline", False)
                 chart_titles = {}
                 for tp in timepoints:
-                    for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance'),
-                                         ('diverging', 'Diverging View')]:
+                    for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance')]:
                         chart_id = f"{tp.name}_{suffix}"
                         raw_title = build_chart_title(tp, text, is_topline)
                         chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
@@ -806,8 +776,7 @@ def step_upload():
                     # Per-group charts if randomized
                     if tp.needs_unrandomization and tp.randomization_groups:
                         for grp_name in tp.randomization_groups:
-                            for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance'),
-                                                 ('diverging', 'Diverging View')]:
+                            for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance')]:
                                 chart_id = f"{tp.name}_{grp_name}_{suffix}"
                                 raw_title = build_chart_title(tp, f"{grp_name} {text}", is_topline)
                                 chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
@@ -962,7 +931,7 @@ def step_config_review_and_generate():
 def _generate_pdf(timepoints, all_tp_stats, titles, is_topline, threshold_pct):
     pdf_buffer = BytesIO()
     progress = st.progress(0, text="Generating charts...")
-    total = len(timepoints) * 3 + (1 if len(timepoints) >= 2 else 0)
+    total = len(timepoints) * 2 + (1 if len(timepoints) >= 2 else 0)
     chart_count = 0
 
     with PdfPages(pdf_buffer) as pdf:
@@ -980,12 +949,6 @@ def _generate_pdf(timepoints, all_tp_stats, titles, is_topline, threshold_pct):
             if fig: pdf.savefig(fig); plt.close(fig)
             chart_count += 1
             progress.progress(chart_count / total, text=f"{tp.name} ranked...")
-
-            fig = create_diverging_chart(tp, stats, is_topline,
-                                         custom_title=titles.get(f"{tp.name}_diverging"))
-            if fig: pdf.savefig(fig); plt.close(fig)
-            chart_count += 1
-            progress.progress(chart_count / total, text=f"{tp.name} diverging...")
 
         if len(timepoints) >= 2:
             fig = create_comparison_page(timepoints, all_tp_stats)
