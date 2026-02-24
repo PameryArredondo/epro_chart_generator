@@ -872,6 +872,13 @@ def step_upload():
 
         if uploaded and st.button("Process Workbook", type="primary"):
             global_exclusions = [x.strip() for x in exclusions_str.split(',') if x.strip()] if exclusions_str else []
+            normalized = []
+            for ex in global_exclusions:
+                try:
+                    normalized.append(f"{int(ex):04d}")
+                except ValueError:
+                    normalized.append(ex)
+            global_exclusions = normalized
 
             with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
                 tmp.write(uploaded.read())
