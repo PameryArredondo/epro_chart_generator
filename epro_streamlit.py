@@ -31,18 +31,14 @@ import json
 # ═══════════════════════════════════════════════════════════════
 
 def load_config_from_json(json_bytes):
-    """
-    Parse VBA-exported JSON (or compatible text file) into TimepointData objects.
-    Accepts bytes from Streamlit file uploader.
-    """
-    # Decode bytes to string first
+    """Parse VBA-exported JSON config into TimepointData objects."""
+    # --- FIX: Decode bytes manually to handle Latin-1 (VBA export) vs UTF-8 ---
     try:
         json_str = json_bytes.decode('utf-8')
     except UnicodeDecodeError:
-        # fallback for older or non-UTF-8 exports
         json_str = json_bytes.decode('latin-1')
+    # --------------------------------------------------------------------------
 
-    # Load JSON
     config = json.loads(json_str)
     settings = config.get("settings", {})
     tp_configs = config.get("timepoints", [])
@@ -64,7 +60,13 @@ def load_config_from_json(json_bytes):
         tp.randomization_groups = tp_cfg.get("randomization_groups", {})
 
         for q_cfg in tp_cfg.get("questions", []):
-            levels = {int(k): v for k, v in q_cfg.get("levels", {}).items() if k.isdigit()}
+            levels = {}
+            for k, v in q_cfg.get("levels", {}).items():
+                try:
+                    levels[int(k)] = v
+                except ValueError:
+                    pass
+
             qi = QuestionInfo(
                 var_name=q_cfg["var_name"],
                 question_text=q_cfg.get("question_text", ""),
@@ -73,16 +75,23 @@ def load_config_from_json(json_bytes):
             )
             qi.is_multi_select = q_cfg.get("is_multi_select", False)
 
+            # Parse favorable mask from VBA format "1,2,3" or "(none)"
             fav_raw = q_cfg.get("fav_mask", "(none)")
-            qi.fav_mask = [] if fav_raw in ("(none)", "(multi-select)", "") else [int(x) for x in fav_raw.split(",") if x.strip().isdigit()]
+            if fav_raw in ("(none)", "(multi-select)", ""):
+                qi.fav_mask = []
+            else:
+                qi.fav_mask = [int(x.strip()) for x in fav_raw.split(",") if x.strip().isdigit()]
 
+            # Parse neutral mask
             neutral_raw = q_cfg.get("neutral_mask", "(none)")
-            qi.neutral_mask = None
             if neutral_raw not in ("(none)", ""):
-                try: qi.neutral_mask = int(neutral_raw)
-                except ValueError: pass
+                try:
+                    qi.neutral_mask = int(neutral_raw)
+                except ValueError:
+                    qi.neutral_mask = None
 
             tp.questions.append(qi)
+
         timepoints.append(tp)
 
     return config, settings, timepoints
