@@ -659,32 +659,71 @@ def create_detailed_bars(tp, all_stats, is_topline, custom_title=None):
 
 def create_comparison_page(timepoints, all_tp_stats):
     if len(timepoints) < 2: return None
+    
+    # 1. Identify common questions across ALL timepoints
     common = None
     tp_q_map = {}
+    
     for tp in timepoints:
-        q_map = {q.q_number: all_tp_stats[tp.name][q.var_name]['fav_pct']
-                 for q in tp.questions if q.is_scaled and not q.is_multi_select
-                 and q.var_name in all_tp_stats.get(tp.name, {})}
+        # Get dict of {q_number: favorable_pct}
+        q_map = {
+            q.q_number: all_tp_stats[tp.name][q.var_name]['fav_pct']
+            for q in tp.questions 
+            if q.is_scaled and not q.is_multi_select
+            and q.var_name in all_tp_stats.get(tp.name, {})
+        }
         tp_q_map[tp.name] = q_map
-        common = set(q_map.keys()) if common is None else common & set(q_map.keys())
+        
+        # Intersect keys to ensure we ONLY graph questions present in all selected timepoints
+        if common is None:
+            common = set(q_map.keys())
+        else:
+            common = common & set(q_map.keys())
+            
     if not common: return None
-    sorted_qs = sorted(common, key=lambda x: (len(x), x))
 
+    # 2. Sort questions numerically (e.g., ensure Q2 comes before Q10)
+    def sort_key(s):
+        # Extract digits for sorting, fallback to string if no digits
+        nums = re.findall(r'\d+', s)
+        return int(nums[0]) if nums else 0
+
+    sorted_qs = sorted(common, key=sort_key)
+
+    # 3. Setup Chart with High Contrast Colors
+    # Blue, Orange, Green, Red, Purple, Brown (Distinct for comparison)
+    contrast_colors = ['#0173B2', '#DE8F05', '#029E73', '#D55E00', '#CC78BC', '#8C564B']
+    
     fig, ax = plt.subplots(figsize=(16, max(6, len(sorted_qs) * 0.5 + 2)))
     x = np.arange(len(sorted_qs))
     width = 0.8 / len(timepoints)
+    
     for i, tp in enumerate(timepoints):
         vals = [tp_q_map[tp.name].get(qn, 0) for qn in sorted_qs]
+        
+        # Use the high-contrast palette
+        bar_color = contrast_colors[i % len(contrast_colors)]
+        
         ax.bar(x + (i - len(timepoints) / 2 + 0.5) * width, vals, width, label=tp.name,
-               color=COLORS['scale_colors'][i % len(COLORS['scale_colors'])], alpha=0.9)
+               color=bar_color, alpha=0.9, edgecolor='white', linewidth=1)
+
     make_bars_rounded(ax, pad=0.02, rounding_size=0.1)
+    
     ax.set_xticks(x)
-    ax.set_xticklabels([f"Q{q}" for q in sorted_qs])
-    ax.set_title("Cross-Timepoint Comparison", fontsize=14, weight='bold', loc='left')
-    ax.legend()
+    ax.set_xticklabels([f"Q{q}" for q in sorted_qs], fontsize=10, weight='bold')
+    ax.set_ylabel("Favorable Response (%)")
+    ax.set_ylim(0, 105)
+    
+    ax.set_title("Cross-Timepoint Comparison (Common Questions Only)", fontsize=14, weight='bold', loc='left')
+    ax.legend(loc='upper right', frameon=True, facecolor='white', framealpha=1)
+    
+    # Add grid behind bars
+    ax.set_axisbelow(True)
+    ax.yaxis.grid(True, color='#EEEEEE')
+    ax.xaxis.grid(False)
+    
     plt.tight_layout()
     return fig
-
 
 # ═══════════════════════════════════════════════════════════════
 # 7. STREAMLIT APP
