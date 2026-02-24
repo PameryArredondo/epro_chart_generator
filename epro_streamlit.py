@@ -760,7 +760,7 @@ def render_sidebar():
 def step_upload():
     st.header("Upload & Configure")
 
-    mode = st.radio("Workflow Mode", ["Import Config (from Excel UserForm)", "Manual (parse workbook)"],
+    mode = st.radio("Workflow Mode", ["Import Json File (Exported from Excel UserForm)", "Create charts from ePro Export"],
                     horizontal=True)
 
     if mode.startswith("📄"):
@@ -833,7 +833,7 @@ def step_upload():
         with col1:
             is_topline = st.toggle("TopLine Report", value=False)
         with col2:
-            exclusions_str = st.text_input("Global Subject Exclusions", placeholder="e.g. 0042, 0091")
+            exclusions_str = st.text_input("Enter Dropped Subjects here", placeholder="e.g. 0042, 0091")
 
         if uploaded and st.button("🔍 Process Workbook", type="primary"):
             global_exclusions = [x.strip() for x in exclusions_str.split(',') if x.strip()] if exclusions_str else []
@@ -1145,3 +1145,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
