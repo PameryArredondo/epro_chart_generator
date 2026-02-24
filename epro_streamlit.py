@@ -29,9 +29,9 @@ import json
 # ═══════════════════════════════════════════════════════════════
 # 1. CONFIGURATION & STYLE
 # ═══════════════════════════════════════════════════════════════
-
 def load_config_from_json(json_bytes):
     """Parse VBA-exported JSON config into TimepointData objects."""
+    
     # --- FIX: Decode bytes manually to handle Latin-1 (VBA export) vs UTF-8 ---
     try:
         json_str = json_bytes.decode('utf-8')
