@@ -740,6 +740,7 @@ def init_session_state():
         'config_settings': {},
         'pdf_bytes': None,
         'pdf_name': '',
+        'tp_names_confirmed': False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -910,6 +911,53 @@ def step_upload():
                     os.unlink(tmp_path)
                     return
 
+                # Store preliminary data so naming step can access it
+                st.session_state.timepoints = timepoints
+                st.session_state.all_tp_stats = all_tp_stats
+                st.session_state.is_topline = is_topline
+                st.session_state.tmp_path = tmp_path
+                st.session_state.file_processed = True
+                st.session_state.config_loaded = False
+                st.session_state.config_settings = {}
+                st.session_state.pdf_name = f"{Path(uploaded.name).stem}{'_TPL' if is_topline else ''}_Charts_v9.pdf"
+                # Don't build chart_titles yet — wait for naming confirmation
+                st.session_state.chart_titles = {}
+                st.session_state.tp_names_confirmed = False
+                st.session_state.step = 0  # Stay on upload page for naming
+                st.rerun()
+
+        # --- Timepoint Naming (shown after workbook is processed) ---
+        if st.session_state.file_processed and not st.session_state.config_loaded and not st.session_state.get('tp_names_confirmed', False):
+            st.divider()
+            st.subheader("Confirm Timepoint Names")
+            st.caption("Review and edit the detected timepoint names. These will appear in all chart titles.")
+
+            timepoints = st.session_state.timepoints
+            is_topline = st.session_state.get('is_topline', False)
+            generic_patterns = ['epro data', 'epro', 'data', 'sheet']
+
+            updated_names = []
+            for i, tp in enumerate(timepoints):
+                is_generic = any(p in tp.name.lower() for p in generic_patterns) or len(tp.name.strip()) < 3
+                default_val = tp.name
+                label = f"Timepoint {i + 1}"
+                if is_generic:
+                    label += " generic name detected"
+                new_name = st.text_input(label, value=default_val, key=f"tp_name_{i}")
+                updated_names.append(new_name)
+
+            if st.button("Confirm Names", type="primary"):
+                # Apply new names and rebuild stats keys + chart titles
+                old_stats = dict(st.session_state.all_tp_stats)
+                new_stats = {}
+                for i, tp in enumerate(timepoints):
+                    old_name = tp.name
+                    tp.name = updated_names[i]
+                    new_stats[tp.name] = old_stats.get(old_name, {})
+
+                st.session_state.all_tp_stats = new_stats
+
+                # Now build chart titles with confirmed names
                 chart_titles = {}
                 for tp in timepoints:
                     for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance')]:
@@ -917,15 +965,8 @@ def step_upload():
                         raw_title = build_chart_title(tp, text, is_topline)
                         chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
 
-                st.session_state.timepoints = timepoints
-                st.session_state.all_tp_stats = all_tp_stats
                 st.session_state.chart_titles = chart_titles
-                st.session_state.is_topline = is_topline
-                st.session_state.tmp_path = tmp_path
-                st.session_state.file_processed = True
-                st.session_state.config_loaded = False
-                st.session_state.config_settings = {}
-                st.session_state.pdf_name = f"{Path(uploaded.name).stem}{'_TPL' if is_topline else ''}_Charts_v9.pdf"
+                st.session_state.tp_names_confirmed = True
                 st.session_state.step = 1
                 st.rerun()
 
