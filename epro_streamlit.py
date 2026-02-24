@@ -905,8 +905,7 @@ def step_upload():
 
                 chart_titles = {}
                 for tp in timepoints:
-                    for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance'),
-                                         ('diverging', 'Diverging View')]:
+                    for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance')]:
                         chart_id = f"{tp.name}_{suffix}"
                         raw_title = build_chart_title(tp, text, is_topline)
                         chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
@@ -1027,8 +1026,9 @@ def _generate_pdf(timepoints, all_tp_stats, titles, is_topline, threshold_pct):
 # === Manual workflow steps (unchanged from v8) ===
 
 def step_scales():
-    st.header("⚖️ Verify Favorable Logic")
-    st.caption("Review and adjust which response values count as 'favorable' for each scale group.")
+    st.header("Verify Favorable Logic")
+    st.caption("Review and adjust which response values count as 'favorable' for each scale group. "
+               "Use per-question overrides for negatively worded or special-case questions.")
     timepoints = st.session_state.timepoints
 
     for tp in timepoints:
@@ -1042,6 +1042,22 @@ def step_scales():
             scale_str = " | ".join([f"**{k}**: {v}" for k, v in sorted(ex_q.levels.items())])
             with st.expander(f"Scale Group — {len(q_list)} questions", expanded=True):
                 st.markdown(f"**Scale:** {scale_str}")
+
+                # Group-level edit
+                current_fav = ", ".join(map(str, ex_q.fav_mask))
+                group_key = f"fav_group_{tp.name}_{id(ex_q)}"
+                new_fav = st.text_input("Favorable values (applies to all in group)", value=current_fav, key=group_key)
+                try:
+                    parsed = [int(x.strip()) for x in new_fav.split(',') if x.strip()]
+                    group_mask = [p for p in parsed if p in ex_q.levels]
+                except:
+                    group_mask = ex_q.fav_mask
+
+                # Apply group mask to all questions (overrides will replace below)
+                for q in q_list:
+                    q.fav_mask = list(group_mask)
+
+                # Question summary table
                 q_data = []
                 for q in q_list:
                     fav_str = ", ".join(map(str, q.fav_mask)) if q.fav_mask else "None"
@@ -1049,15 +1065,34 @@ def step_scales():
                                    "Question": q.question_text[:80]})
                 st.dataframe(pd.DataFrame(q_data), use_container_width=True, hide_index=True)
 
-                current_fav = ", ".join(map(str, ex_q.fav_mask))
-                key = f"fav_{tp.name}_{id(ex_q)}"
-                new_fav = st.text_input(f"Favorable values for this group", value=current_fav, key=key)
-                try:
-                    parsed = [int(x.strip()) for x in new_fav.split(',') if x.strip()]
-                    valid = [p for p in parsed if p in ex_q.levels]
-                    if valid:
-                        for q in q_list: q.fav_mask = valid
-                except: pass
+                # Per-question overrides
+                if len(q_list) > 1:
+                    override_key = f"show_overrides_{tp.name}_{id(ex_q)}"
+                    show_overrides = st.checkbox("Show per-question overrides", key=override_key, value=False)
+
+                    if show_overrides:
+                        st.caption("Leave blank or match the group value to keep the default. "
+                                   "Enter different values to override for that question.")
+                        for q in q_list:
+                            col1, col2 = st.columns([3, 2])
+                            with col1:
+                                st.markdown(f"**Q{q.q_number}:** {q.question_text[:60]}")
+                            with col2:
+                                q_key = f"fav_q_{tp.name}_{q.var_name}"
+                                q_current = ", ".join(map(str, q.fav_mask))
+                                q_new = st.text_input(
+                                    f"Favorable for Q{q.q_number}",
+                                    value=q_current,
+                                    key=q_key,
+                                    label_visibility="collapsed"
+                                )
+                                try:
+                                    q_parsed = [int(x.strip()) for x in q_new.split(',') if x.strip()]
+                                    q_valid = [p for p in q_parsed if p in q.levels]
+                                    if q_valid:
+                                        q.fav_mask = q_valid
+                                except:
+                                    pass
 
     if st.button("Confirm Scales", type="primary"):
         for tp in st.session_state.timepoints:
@@ -1099,6 +1134,25 @@ def step_subjects():
     if not any_non_completed:
         st.success("All subjects completed across all timepoints.")
 
+    # Show summary of analyzed vs excluded subjects per timepoint
+    st.divider()
+    st.subheader("Subject Summary")
+    for tp in timepoints:
+        with st.expander(f"{tp.name} — {len(tp.included_subjects)} included, {len(tp.dropped_ids)} excluded", expanded=True):
+            col_inc, col_exc = st.columns(2)
+            with col_inc:
+                st.markdown("**Included Subjects**")
+                if tp.included_subjects:
+                    st.text(", ".join(sorted(tp.included_subjects)))
+                else:
+                    st.caption("None")
+            with col_exc:
+                st.markdown("**Excluded / Dropped Subjects**")
+                if tp.dropped_ids:
+                    st.text(", ".join(sorted(set(tp.dropped_ids))))
+                else:
+                    st.caption("None")
+
     if st.button("Confirm Subjects", type="primary"):
         for tp in st.session_state.timepoints:
             stats = {}
@@ -1131,11 +1185,15 @@ def step_generate_manual():
     is_topline = st.session_state.get('is_topline', False)
     threshold_pct = FAVORABLE_THRESHOLD * 100
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
     col1.metric("Timepoints", len(timepoints))
     col2.metric("Total Charts", len(titles))
-    col3.metric("Included Subjects", sum(tp.n_included for tp in timepoints))
-    col4.metric("Center", CENTER_FILTER)
+    col3.metric("Center", CENTER_FILTER)
+
+    # Per-timepoint n counts
+    tp_cols = st.columns(len(timepoints))
+    for i, tp in enumerate(timepoints):
+        tp_cols[i].metric(f"n — {tp.name}", tp.n_included)
 
     if st.session_state.pdf_bytes:
         st.success("PDF generated!")
@@ -1148,7 +1206,6 @@ def step_generate_manual():
 
     if st.button("Generate PDF", type="primary"):
         _generate_pdf(timepoints, all_tp_stats, titles, is_topline, threshold_pct)
-
 
 # ═══════════════════════════════════════════════════════════════
 # 8. MAIN APP ENTRY
