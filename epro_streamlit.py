@@ -532,9 +532,9 @@ def create_dashboard_page(tp, all_stats, is_topline, threshold_pct, custom_title
         {'label': 'Total Enrolled', 'val': str(total_enrolled),
          'sub': 'VCS Center', 'x': 0.05, 'c': COLORS['favorable']},
         {'label': 'Completed', 'val': str(tp.n_completed),
-         'sub': f'{(tp.n_completed / total_enrolled * 100):.1f}% Rate' if total_enrolled else '—',
+         'sub': f'{(tp.n_completed / total_enrolled * 100):.2f}% Rate' if total_enrolled else '—',
          'x': 0.29, 'c': COLORS['excellent']},
-        {'label': 'Avg Favorable', 'val': f"{avg_fav:.1f}%", 'sub': 'All Questions', 'x': 0.53,
+        {'label': 'Avg Favorable', 'val': f"{avg_fav:.2f}%", 'sub': 'All Questions', 'x': 0.53,
          'c': COLORS['text_main']},
         {'label': f'Questions >{int(thresh_val)}%',
          'val': str(sum(1 for x in fav_vals if x >= thresh_val)), 'sub': 'Favorable Rate', 'x': 0.77,
@@ -613,7 +613,7 @@ def create_ranked_chart(tp, all_stats, is_topline, threshold_pct, custom_title=N
     ax.set_title(title, fontsize=14, weight='bold', loc='left')
     ax.axvline(threshold_pct, color=COLORS['excellent'], linestyle='--', linewidth=1)
     for i, v in enumerate(vals):
-        ax.text(v + 1, i, f"{v:.1f}%", va='center', fontsize=9)
+        ax.text(v + 1, i, f"{v:.2f}%", va='center', fontsize=9)
     plt.tight_layout()
     return fig
 
@@ -632,7 +632,7 @@ def create_detailed_bars(tp, all_stats, is_topline, custom_title=None):
             c = COLORS['scale_colors'][j % len(COLORS['scale_colors'])]
             ax.barh(i, pct, left=left, height=0.7, color=c, edgecolor='white', linewidth=1)
             if pct > 6:
-                ax.text(left + pct / 2, i, f"{int(pct)}", ha='center', va='center', color='white', fontsize=8)
+                ax.text(left + pct / 2, i, f"{pct:.2f}", ha='center', va='center', color='white', fontsize=8)
             left += pct
 
     ax.set_yticks(np.arange(len(sorted_qs)))
@@ -967,7 +967,7 @@ def step_scales():
     timepoints = st.session_state.timepoints
 
     for tp in timepoints:
-        st.subheader(f"📋 {tp.name}")
+        st.subheader(f"{tp.name}")
         groups = defaultdict(list)
         for q in tp.questions:
             if q.is_scaled: groups[q.scale_signature].append(q)
