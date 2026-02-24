@@ -727,23 +727,37 @@ def render_sidebar():
                 st.session_state.step = i
                 st.rerun()
 
-
 def step_upload():
     st.header("Upload & Configure")
 
-    mode = st.radio("Workflow Mode", ["Import Json File (Exported from Excel UserForm)", "Create charts from ePro Export"],
-                    horizontal=True)
+    # === WORKFLOW MODE RADIO WITH INFO ICON ===
+    import_info = (
+        "Upload the VBA-exported JSON configuration **and** the matching ePRO Excel workbook.\n\n"
+        "The JSON contains all scale decisions, exclusions, and masks, while the workbook "
+        "contains the actual survey responses used to compute statistics and generate charts.\n\n"
+        "If JSON is not compatible, a properly formatted text file exported from the Excel UserForm can be used instead."
+    )
 
-    if mode.startswith("📄"):
-        st.subheader("Import VBA Config")
-        st.caption("Upload the JSON config exported from the Excel ePRO UserForm. "
-                   "All scale decisions, exclusions, and masks are pre-loaded — you skip straight to charts.")
+    mode = st.radio(
+        "Workflow Mode",
+        [
+            "Import VBA Config + ePRO Workbook ",
+            "Manual Workbook Import"
+        ],
+        horizontal=True
+    )
 
-        config_file = st.file_uploader("Upload config JSON", type=["json"])
-        workbook_file = st.file_uploader("Upload matching ePRO Workbook", type=["xlsx", "xls"],
-                                         help="The same workbook used in the Excel UserForm")
+    # Display tooltip/info below the radio
+    if mode.startswith("Import VBA Config"):
+        st.caption(import_info)
 
-        if config_file and workbook_file and st.button("🔗 Load Config + Data", type="primary"):
+        config_file = st.file_uploader("Upload JSON configuration (or compatible text file)", type=["json", "txt"])
+        workbook_file = st.file_uploader(
+            "Upload ePRO Workbook (required)", type=["xlsx", "xls"],
+            help="Must be the same workbook used in the Excel UserForm export"
+        )
+
+        if config_file and workbook_file and st.button("Load Config + Data", type="primary"):
             with st.spinner("Loading configuration..."):
                 config, settings, timepoints = load_config_from_json(config_file.read())
 
@@ -794,9 +808,13 @@ def step_upload():
                 st.rerun()
 
     else:
-        # === MANUAL WORKFLOW (same as v8) ===
-        st.subheader("Manual Workbook Import")
-        uploaded = st.file_uploader("Upload ePRO Workbook", type=["xlsx", "xls"])
+        # === MANUAL WORKFLOW ===
+        st.subheader("Manual ePRO Workbook Import")
+        st.caption(
+            "Upload only the raw ePRO Excel workbook. "
+            "Streamlit will detect questions, scales, and compute stats manually."
+        )
+        uploaded = st.file_uploader("Upload ePRO Workbook (required)", type=["xlsx", "xls"])
 
         col1, col2 = st.columns(2)
         with col1:
@@ -804,7 +822,7 @@ def step_upload():
         with col2:
             exclusions_str = st.text_input("Enter Dropped Subjects here", placeholder="e.g. 0042, 0091")
 
-        if uploaded and st.button("🔍 Process Workbook", type="primary"):
+        if uploaded and st.button("Process Workbook", type="primary"):
             global_exclusions = [x.strip() for x in exclusions_str.split(',') if x.strip()] if exclusions_str else []
 
             with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
@@ -856,7 +874,6 @@ def step_upload():
                 st.session_state.pdf_name = f"{Path(uploaded.name).stem}{'_TPL' if is_topline else ''}_Charts_v9.pdf"
                 st.session_state.step = 1
                 st.rerun()
-
 
 def step_config_review_and_generate():
     """Combined review + generate for config-loaded workflow."""
