@@ -910,7 +910,7 @@ def init_session_state():
 
 def render_sidebar():
     with st.sidebar:
-        st.markdown("## 📊 ePRO Chart Gen v9.1")
+        st.markdown("## ePRO Chart Gen v9.1")
         st.caption("Config-Aware Edition")
         st.divider()
 
@@ -939,10 +939,10 @@ def render_sidebar():
 def _render_sheet_preview(sheet_name, info):
     """Display a compact preview of a sheet's contents."""
     badge = {
-        'questionnaire': '📋 Questionnaire',
-        'option_values': '📖 Option Values',
-        'unknown': '❓ Unknown',
-    }.get(info['type'], '❓ Unknown')
+        'questionnaire': 'Questionnaire',
+        'option_values': 'Option Values',
+        'unknown': 'Unknown',
+    }.get(info['type'], 'Unknown')
 
     st.markdown(f"**{sheet_name}** — {badge}")
     st.caption(f"{info['n_cols']} columns | Headers: {', '.join(info['headers'][:6])}{'...' if len(info['headers']) > 6 else ''}")
@@ -1137,8 +1137,7 @@ def step_upload():
             split_neutral = st.checkbox("Split Neutral", value=False,
                 help="When enabled, neutral/midpoint responses (e.g. \"Neither Agree nor Disagree\") "
                      "are split 50/50 between the favorable and unfavorable sides rather than being "
-                     "counted as a standalone category. This is common in Likert-scale analysis where "
-                     "the midpoint is considered ambivalent rather than truly neutral.")
+                     "counted as a standalone category.")
         with col3:
             exclusions_str = st.text_input("Enter Dropped Subjects here", placeholder="e.g. 0042, 0091")
 
@@ -1180,7 +1179,7 @@ def step_upload():
         # === MANUAL SHEET PAIRING FALLBACK ===
         if st.session_state.get('needs_manual_pairing') and not st.session_state.get('manual_pairs_confirmed'):
             st.divider()
-            st.subheader("⚠️ Sheet Pairing Required")
+            st.subheader("Sheet Pairing Required")
             st.info(
                 "Auto-detection couldn't fully pair all questionnaire sheets with their option-values sheets. "
                 "Please review the sheets below and confirm the correct pairings."
@@ -1339,7 +1338,7 @@ def step_config_review_and_generate():
         st.success("PDF generated successfully!")
         st.download_button("Download PDF", data=st.session_state.pdf_bytes,
                            file_name=st.session_state.pdf_name, mime="application/pdf", type="primary")
-        if st.button("🔄 Regenerate"):
+        if st.button("Regenerate"):
             st.session_state.pdf_bytes = None
             st.rerun()
         return
@@ -1581,3 +1580,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
