@@ -1,10 +1,12 @@
 """
-ePRO Chart Generator v9 — Streamlit Edition (Config-Aware)
+ePRO Chart Generator v9.1 — Streamlit Edition (Config-Aware)
 ============================================================
 Run with:  streamlit run epro_streamlit_v9.py
 Requires:  pip install streamlit pandas numpy matplotlib openpyxl
 
-NEW IN v9:
+NEW IN v9.1:
+  - Improved option-value sheet detection (SheetName + "1" convention)
+  - Manual sheet pairing fallback with previews when auto-detect fails
   - Import JSON config exported from the VBA UserForm
   - Skips scale verification, subject inclusion, and title editing
     when config is loaded (all decisions already finalized)
@@ -111,7 +113,7 @@ class TimepointData:
         self.included_subjects = []
         self.non_completed = []
         self.dropped_ids = []
-        self.deviation_subjects = {}  # sid -> reason
+        self.deviation_subjects = {}
         self.study_refs = []
         self.n_total = 0
         self.n_completed = 0
@@ -126,14 +128,10 @@ class TimepointData:
 # ═══════════════════════════════════════════════════════════════
 
 def load_config_from_json(json_bytes):
-    """Parse VBA-exported JSON config into TimepointData objects."""
-    
-    # --- FIX: Decode bytes manually to handle Latin-1 (VBA export) vs UTF-8 ---
     try:
         json_str = json_bytes.decode('utf-8')
     except UnicodeDecodeError:
         json_str = json_bytes.decode('latin-1')
-    # --------------------------------------------------------------------------
 
     config = json.loads(json_str)
     settings = config.get("settings", {})
@@ -171,14 +169,12 @@ def load_config_from_json(json_bytes):
             )
             qi.is_multi_select = q_cfg.get("is_multi_select", False)
 
-            # Parse favorable mask from VBA format "1,2,3" or "(none)"
             fav_raw = q_cfg.get("fav_mask", "(none)")
             if fav_raw in ("(none)", "(multi-select)", ""):
                 qi.fav_mask = []
             else:
                 qi.fav_mask = [int(x.strip()) for x in fav_raw.split(",") if x.strip().isdigit()]
 
-            # Parse neutral mask
             neutral_raw = q_cfg.get("neutral_mask", "(none)")
             if neutral_raw not in ("(none)", ""):
                 try:
@@ -187,60 +183,178 @@ def load_config_from_json(json_bytes):
                     qi.neutral_mask = None
 
             tp.questions.append(qi)
-
         timepoints.append(tp)
 
     return config, settings, timepoints
 
 
 def compute_n_included_from_config(tp, settings):
-    """
-    Replicate VBA UpdateIncludedLabel logic:
-    n = total (or completed if completed_only) - excluded - deviation(NoData/EXCLUDE_N)
-    """
     completed_only = settings.get("completed_only", False)
     n = tp.n_completed if completed_only else tp.n_total
-
     n -= len(tp.dropped_ids)
-
     for sid, reason in tp.deviation_subjects.items():
         if "No Data" in reason or reason.startswith("[EXCLUDE_N]"):
             n -= 1
-
     return max(n, 0)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 4. PARSING LOGIC (Manual Workflow — unchanged from v8)
+# 4. SHEET DETECTION & CLASSIFICATION
 # ═══════════════════════════════════════════════════════════════
 
+def classify_sheet(excel_path, sheet_name):
+    """
+    Read the first few rows of a sheet and classify it.
+    Returns a dict with:
+      - 'type': 'option_values' | 'questionnaire' | 'unknown'
+      - 'headers': list of column headers (row 1)
+      - 'preview_rows': list of dicts for first few data rows
+      - 'n_cols': number of columns
+      - 'n_rows': approximate row count
+    """
+    try:
+        df_peek = pd.read_excel(excel_path, sheet_name=sheet_name, nrows=8, header=None)
+    except Exception:
+        return {'type': 'unknown', 'headers': [], 'preview_rows': [], 'n_cols': 0, 'n_rows': 0}
+
+    if df_peek.empty or df_peek.shape[1] < 2:
+        return {'type': 'unknown', 'headers': [], 'preview_rows': [], 'n_cols': 0, 'n_rows': 0}
+
+    headers = [str(v).strip() for v in df_peek.iloc[0] if pd.notna(v)]
+    headers_upper = [h.upper() for h in headers]
+
+    # Option values sheet: first 3 headers are VARIABLE NAME, OPTION NAME, OPTION VALUE
+    if len(headers_upper) >= 3 and headers_upper[:3] == ["VARIABLE NAME", "OPTION NAME", "OPTION VALUE"]:
+        preview_df = df_peek.iloc[1:6].copy()
+        preview_df.columns = list(df_peek.iloc[0])
+        return {
+            'type': 'option_values',
+            'headers': headers,
+            'preview_df': preview_df,
+            'n_cols': df_peek.shape[1],
+            'n_rows': None,  # unknown without full read
+        }
+
+    # Questionnaire sheet: has SUBJECT ID + STATUS columns
+    has_subject = COL_SUBJECT in headers_upper
+    has_status = COL_STATUS in headers_upper
+    quest_name = any(x in sheet_name.lower() for x in ["questionna", "quest", " q "])
+
+    if has_subject and has_status:
+        sheet_type = 'questionnaire'
+    elif quest_name and (has_subject or has_status):
+        sheet_type = 'questionnaire'
+    else:
+        sheet_type = 'unknown'
+
+    # Build preview from row 3 onward (row 1 = var names, row 2 = question text)
+    row2 = [str(v).strip() if pd.notna(v) else "" for v in df_peek.iloc[1]] if df_peek.shape[0] > 1 else []
+    preview_df = df_peek.iloc[2:6].copy() if df_peek.shape[0] > 2 else pd.DataFrame()
+    if not preview_df.empty:
+        preview_df.columns = list(df_peek.iloc[0])
+
+    return {
+        'type': sheet_type,
+        'headers': headers,
+        'question_texts': row2,
+        'preview_df': preview_df,
+        'n_cols': df_peek.shape[1],
+        'n_rows': None,
+    }
+
+
 def detect_questionnaire_sheets(excel_path):
+    """Auto-detect questionnaire sheets (returns list of (sheet_name, display_name))."""
     xls = pd.ExcelFile(excel_path)
     results = []
     for sheet_name in xls.sheet_names:
-        try:
-            df = pd.read_excel(xls, sheet_name=sheet_name, nrows=2, header=None)
-        except: continue
-        if df.empty or df.shape[1] < 3: continue
-        headers = [str(v).strip().upper() for v in df.iloc[0] if pd.notna(v)]
-        if headers[:3] == ["VARIABLE NAME", "OPTION NAME", "OPTION VALUE"]: continue
-        is_quest = any(x in sheet_name.lower() for x in ["questionna", "quest", " q "])
-        header_match = sum(1 for k in [COL_STUDY, COL_SUBJECT, COL_STATUS] if k in headers)
-        if is_quest or header_match >= 2:
+        info = classify_sheet(excel_path, sheet_name)
+        if info['type'] == 'questionnaire':
             results.append((sheet_name, sheet_name))
     return results
 
 
 def find_option_values_sheet(excel_path, questionnaire_sheet_name):
+    """
+    Try multiple strategies to find the option-values sheet for a questionnaire tab.
+    """
     xls = pd.ExcelFile(excel_path)
+
+    # Strategy 1: SheetName + "1" convention  (e.g. "CS251045 Week 2 Questionnaire" -> + "1")
+    candidate = questionnaire_sheet_name + "1"
+    if candidate in xls.sheet_names:
+        info = classify_sheet(excel_path, candidate)
+        if info['type'] == 'option_values':
+            return candidate
+
+    # Strategy 2: Prefix-dash convention (e.g. "2-Questionnaire" -> "2-Option Values")
     if len(questionnaire_sheet_name) > 2 and questionnaire_sheet_name[1] == '-':
         prefix = questionnaire_sheet_name[:2]
         for sn in xls.sheet_names:
-            if sn.startswith(prefix) and "option" in sn.lower(): return sn
+            if sn.startswith(prefix) and "option" in sn.lower():
+                return sn
+
+    # Strategy 3: Shared base name with OV-like suffix
+    #   e.g. "Week 2 Questionnaire" -> "Week 2 Questionnaire OV" or "Week 2 Option Values"
+    base_lower = questionnaire_sheet_name.lower()
     for sn in xls.sheet_names:
-        if "option" in sn.lower() and "value" in sn.lower(): return sn
+        sn_lower = sn.lower()
+        if sn_lower == base_lower:
+            continue
+        # Must share a significant prefix with the questionnaire sheet
+        if sn_lower.startswith(base_lower[:min(len(base_lower), 10)]):
+            info = classify_sheet(excel_path, sn)
+            if info['type'] == 'option_values':
+                return sn
+
+    # Strategy 4: Global fallback — any sheet with "option" and "value" in the name
+    for sn in xls.sheet_names:
+        if "option" in sn.lower() and "value" in sn.lower():
+            return sn
+
+    # Strategy 5: Any sheet whose content matches OV structure
+    for sn in xls.sheet_names:
+        if sn == questionnaire_sheet_name:
+            continue
+        info = classify_sheet(excel_path, sn)
+        if info['type'] == 'option_values':
+            return sn
+
     return None
 
+
+def auto_pair_sheets(excel_path):
+    """
+    Attempt full auto-pairing of questionnaire sheets to option-value sheets.
+    Returns:
+      - pairs: list of (quest_sheet, ov_sheet) successfully paired
+      - unpaired_quest: list of quest sheets with no OV match
+      - all_sheet_info: dict of {sheet_name: classify_sheet result} for manual fallback
+    """
+    xls = pd.ExcelFile(excel_path)
+    all_sheet_info = {}
+    for sn in xls.sheet_names:
+        all_sheet_info[sn] = classify_sheet(excel_path, sn)
+
+    quest_sheets = detect_questionnaire_sheets(excel_path)
+    pairs = []
+    unpaired_quest = []
+    used_ov = set()
+
+    for sheet_name, display in quest_sheets:
+        ov = find_option_values_sheet(excel_path, sheet_name)
+        if ov and ov not in used_ov:
+            pairs.append((sheet_name, ov))
+            used_ov.add(ov)
+        else:
+            unpaired_quest.append(sheet_name)
+
+    return pairs, unpaired_quest, all_sheet_info
+
+
+# ═══════════════════════════════════════════════════════════════
+# 5. PARSING LOGIC (Manual Workflow)
+# ═══════════════════════════════════════════════════════════════
 
 def build_scale_library(excel_path, ov_sheet_name):
     df = pd.read_excel(excel_path, sheet_name=ov_sheet_name, header=0)
@@ -338,8 +452,34 @@ def load_timepoint(excel_path, sheet_name, ov_sheet_name, global_exclusions):
     return tp
 
 
-def compute_stats(tp, q):
-    """Compute stats for manual-workflow timepoints (have subject_data)."""
+def detect_neutral_index(levels, fav_mask):
+    """
+    Auto-detect the neutral/midpoint index for a scale.
+    Looks for keywords like 'neither', 'neutral', 'undecided', 'no opinion',
+    or falls back to the numeric midpoint of an odd-length scale.
+    Returns the index or None.
+    """
+    neutral_keywords = ['NEITHER', 'NEUTRAL', 'UNDECIDED', 'NO OPINION', 'NOT SURE',
+                        'UNCERTAIN', 'MIXED', "DON'T KNOW", 'DONT KNOW']
+    sorted_keys = sorted(levels.keys())
+
+    # Keyword match
+    for idx in sorted_keys:
+        label_upper = levels[idx].upper()
+        if any(kw in label_upper for kw in neutral_keywords):
+            return idx
+
+    # Numeric midpoint for odd-length scales (e.g. 5-point: index 3 is middle)
+    if len(sorted_keys) % 2 == 1:
+        mid = sorted_keys[len(sorted_keys) // 2]
+        # Only treat as neutral if it's not already in fav_mask and not the lowest
+        if mid not in fav_mask and mid != sorted_keys[0]:
+            return mid
+
+    return None
+
+
+def compute_stats(tp, q, split_neutral=False):
     if not q.is_scaled: return None
     df = tp.subject_data[tp.subject_data['_SID'].isin(tp.included_subjects)]
     counts = {k: 0 for k in q.levels.keys()}
@@ -347,20 +487,55 @@ def compute_stats(tp, q):
         try: v = int(float(val)); counts[v] = counts.get(v, 0) + 1
         except: pass
     n = tp.n_included
-    fav = sum(counts[k] for k in q.fav_mask)
+
+    # Auto-detect neutral if not already set
+    if q.neutral_mask is None and split_neutral:
+        q.neutral_mask = detect_neutral_index(q.levels, q.fav_mask)
+
+    display_counts = dict(counts)
+
+    if split_neutral and q.neutral_mask is not None:
+        neutral_idx = q.neutral_mask
+        if neutral_idx in counts and counts[neutral_idx] > 0:
+            neutral_total = counts[neutral_idx]
+            to_agree = neutral_total // 2
+            to_disagree = neutral_total - to_agree
+
+            agree_target = None
+            for idx in sorted(q.fav_mask, reverse=True):
+                if idx != neutral_idx:
+                    agree_target = idx
+                    break
+
+            disagree_target = None
+            for idx in sorted(q.levels.keys()):
+                if idx not in q.fav_mask and idx != neutral_idx:
+                    disagree_target = idx
+                    break
+
+            if agree_target is not None:
+                display_counts[agree_target] = display_counts.get(agree_target, 0) + to_agree
+            if disagree_target is not None:
+                display_counts[disagree_target] = display_counts.get(disagree_target, 0) + to_disagree
+            display_counts[neutral_idx] = 0
+
+    strict_fav = sum(counts[k] for k in q.fav_mask)
+    neutral_contribution = 0
+    if split_neutral and q.neutral_mask is not None and q.neutral_mask in counts:
+        neutral_contribution = counts[q.neutral_mask] // 2
+    total_fav = strict_fav + neutral_contribution
+
+    fav_pct = (total_fav / n * 100) if n else 0
+
     return {
-        'level_pcts': {k: (v / n * 100 if n else 0) for k, v in counts.items()},
-        'fav_pct': (fav / n * 100) if n else 0,
-        'unfav_pct': 100 - ((fav / n * 100) if n else 0),
+        'level_pcts': {k: (v / n * 100 if n else 0) for k, v in display_counts.items()},
+        'fav_pct': fav_pct,
+        'unfav_pct': 100 - fav_pct,
         'n': n
     }
 
 
 def compute_stats_from_config(tp, q, excel_path, settings):
-    """
-    Compute stats for config-loaded timepoints by reading the actual workbook
-    but applying the finalized masks/exclusions from the config.
-    """
     if not q.is_scaled or q.is_multi_select:
         return None
 
@@ -387,23 +562,19 @@ def compute_stats_from_config(tp, q, excel_path, settings):
 
     df_data['_SID'] = df_data[c_subj].apply(fmt_sid)
 
-    # Apply center filter
     center = settings.get("center_filter", CENTER_FILTER)
     if c_cent:
         df_data = df_data[df_data[c_cent].astype(str).str.upper().str.strip() == center]
 
-    # Apply exclusions
     excluded = set(tp.dropped_ids)
     df_data = df_data[~df_data['_SID'].isin(excluded)]
 
-    # Apply deviation exclusions (No Data / EXCLUDE_N)
     dev_exclude = set()
     for sid, reason in tp.deviation_subjects.items():
         if "No Data" in reason or reason.startswith("[EXCLUDE_N]"):
             dev_exclude.add(sid)
     df_data = df_data[~df_data['_SID'].isin(dev_exclude)]
 
-    # Completed only filter
     if settings.get("completed_only", False) and c_stat:
         df_data = df_data[df_data[c_stat].astype(str).str.upper().str.strip() == "COMPLETED"]
 
@@ -411,7 +582,6 @@ def compute_stats_from_config(tp, q, excel_path, settings):
     if n == 0:
         return {'level_pcts': {}, 'fav_pct': 0, 'unfav_pct': 100, 'n': 0}
 
-    # Find the column for this variable
     var_col = None
     for h in headers:
         norm_h = re.sub(r'_1$', '', h)
@@ -431,7 +601,6 @@ def compute_stats_from_config(tp, q, excel_path, settings):
         except:
             pass
 
-    # Handle split-neutral
     split_neutral = settings.get("split_neutral", False)
     display_counts = dict(counts)
 
@@ -442,14 +611,12 @@ def compute_stats_from_config(tp, q, excel_path, settings):
             to_agree = neutral_total // 2
             to_disagree = neutral_total - to_agree
 
-            # Find agree target (highest fav index that isn't neutral)
             agree_target = None
             for idx in sorted(q.fav_mask, reverse=True):
                 if idx != neutral_idx:
                     agree_target = idx
                     break
 
-            # Find disagree target (lowest non-fav, non-neutral)
             disagree_target = None
             for idx in sorted(q.levels.keys()):
                 if idx not in q.fav_mask and idx != neutral_idx:
@@ -462,7 +629,6 @@ def compute_stats_from_config(tp, q, excel_path, settings):
                 display_counts[disagree_target] = display_counts.get(disagree_target, 0) + to_disagree
             display_counts[neutral_idx] = 0
 
-    # Favorable calculation (uses original counts for strict fav, adds neutral split)
     strict_fav = sum(counts.get(k, 0) for k in q.fav_mask)
     neutral_contribution = 0
     if split_neutral and q.neutral_mask is not None and q.neutral_mask in counts:
@@ -480,7 +646,7 @@ def compute_stats_from_config(tp, q, excel_path, settings):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 5. TITLE CLEANING
+# 6. TITLE CLEANING
 # ═══════════════════════════════════════════════════════════════
 
 def build_chart_title(tp, text, is_topline):
@@ -500,7 +666,7 @@ def clean_chart_title(chart_id, suggested_title):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 6. CHART GENERATION (unchanged from v8)
+# 7. CHART GENERATION
 # ═══════════════════════════════════════════════════════════════
 
 def make_bars_rounded(ax, pad=0.1, rounding_size=0.3):
@@ -586,9 +752,7 @@ def create_dashboard_page(tp, all_stats, is_topline, threshold_pct, custom_title
     ax.axhline(thresh_val, color=COLORS['neutral'], linestyle='--', alpha=0.5, linewidth=1)
     ax.legend(loc='upper left', frameon=False, fontsize=9)
 
-    # Excluded subjects footer (dropped only, no deviation details)
     excluded = sorted(set(tp.dropped_ids))
-
     if excluded:
         drop_str = ", ".join(excluded)
         fig.text(0.05, 0.08, f"Dropped/Excluded Subjects ({len(excluded)}):",
@@ -657,76 +821,67 @@ def create_detailed_bars(tp, all_stats, is_topline, custom_title=None):
     plt.tight_layout()
     return fig
 
+
 def create_comparison_page(timepoints, all_tp_stats):
     if len(timepoints) < 2: return None
-    
-    # 1. Identify common questions across ALL timepoints
+
     common = None
     tp_q_map = {}
-    
+
     for tp in timepoints:
-        # Get dict of {q_number: favorable_pct}
         q_map = {
             q.q_number: all_tp_stats[tp.name][q.var_name]['fav_pct']
-            for q in tp.questions 
+            for q in tp.questions
             if q.is_scaled and not q.is_multi_select
             and q.var_name in all_tp_stats.get(tp.name, {})
         }
         tp_q_map[tp.name] = q_map
-        
-        # Intersect keys to ensure we ONLY graph questions present in all selected timepoints
+
         if common is None:
             common = set(q_map.keys())
         else:
             common = common & set(q_map.keys())
-            
+
     if not common: return None
 
-    # 2. Sort questions numerically (e.g., ensure Q2 comes before Q10)
     def sort_key(s):
-        # Extract digits for sorting, fallback to string if no digits
         nums = re.findall(r'\d+', s)
         return int(nums[0]) if nums else 0
 
     sorted_qs = sorted(common, key=sort_key)
 
-    # 3. Setup Chart with High Contrast Colors
-    # Blue, Orange, Green, Red, Purple, Brown (Distinct for comparison)
     contrast_colors = ['#0173B2', '#DE8F05', '#029E73', '#D55E00', '#CC78BC', '#8C564B']
-    
+
     fig, ax = plt.subplots(figsize=(16, max(6, len(sorted_qs) * 0.5 + 2)))
     x = np.arange(len(sorted_qs))
     width = 0.8 / len(timepoints)
-    
+
     for i, tp in enumerate(timepoints):
         vals = [tp_q_map[tp.name].get(qn, 0) for qn in sorted_qs]
-        
-        # Use the high-contrast palette
         bar_color = contrast_colors[i % len(contrast_colors)]
-        
         ax.bar(x + (i - len(timepoints) / 2 + 0.5) * width, vals, width, label=tp.name,
                color=bar_color, alpha=0.9, edgecolor='white', linewidth=1)
 
     make_bars_rounded(ax, pad=0.02, rounding_size=0.1)
-    
+
     ax.set_xticks(x)
     ax.set_xticklabels([f"Q{q}" for q in sorted_qs], fontsize=10, weight='bold')
     ax.set_ylabel("Favorable Response (%)")
     ax.set_ylim(0, 105)
-    
+
     ax.set_title("Cross-Timepoint Comparison (Common Questions Only)", fontsize=14, weight='bold', loc='left')
     ax.legend(loc='upper right', frameon=True, facecolor='white', framealpha=1)
-    
-    # Add grid behind bars
+
     ax.set_axisbelow(True)
     ax.yaxis.grid(True, color='#EEEEEE')
     ax.xaxis.grid(False)
-    
+
     plt.tight_layout()
     return fig
 
+
 # ═══════════════════════════════════════════════════════════════
-# 7. STREAMLIT APP
+# 8. STREAMLIT APP
 # ═══════════════════════════════════════════════════════════════
 
 def init_session_state():
@@ -741,6 +896,12 @@ def init_session_state():
         'pdf_bytes': None,
         'pdf_name': '',
         'tp_names_confirmed': False,
+        # Manual sheet pairing state
+        'needs_manual_pairing': False,
+        'auto_pairs': [],
+        'unpaired_quest': [],
+        'all_sheet_info': {},
+        'manual_pairs_confirmed': False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -749,7 +910,7 @@ def init_session_state():
 
 def render_sidebar():
     with st.sidebar:
-        st.markdown("## 📊 ePRO Chart Gen v9")
+        st.markdown("## 📊 ePRO Chart Gen v9.1")
         st.caption("Config-Aware Edition")
         st.divider()
 
@@ -759,7 +920,6 @@ def render_sidebar():
                 "1️⃣ Upload & Configure",
                 "2️⃣ Review & Generate",
             ]
-            max_step = 1
         else:
             steps = [
                 "1️⃣ Upload & Configure",
@@ -768,7 +928,6 @@ def render_sidebar():
                 "4️⃣ Review Titles",
                 "5️⃣ Generate PDF",
             ]
-            max_step = 4
 
         for i, label in enumerate(steps):
             disabled = i > st.session_state.step + 1
@@ -776,10 +935,121 @@ def render_sidebar():
                 st.session_state.step = i
                 st.rerun()
 
+
+def _render_sheet_preview(sheet_name, info):
+    """Display a compact preview of a sheet's contents."""
+    badge = {
+        'questionnaire': '📋 Questionnaire',
+        'option_values': '📖 Option Values',
+        'unknown': '❓ Unknown',
+    }.get(info['type'], '❓ Unknown')
+
+    st.markdown(f"**{sheet_name}** — {badge}")
+    st.caption(f"{info['n_cols']} columns | Headers: {', '.join(info['headers'][:6])}{'...' if len(info['headers']) > 6 else ''}")
+
+    preview_df = info.get('preview_df', pd.DataFrame())
+    if not preview_df.empty:
+        # Show max 5 columns to keep it compact
+        display_cols = list(preview_df.columns[:5])
+        st.dataframe(preview_df[display_cols].head(3), use_container_width=True, hide_index=True)
+
+
+def _render_manual_pairing_ui(excel_path):
+    """
+    Show all sheets with previews and let user manually select
+    questionnaire ↔ option-value pairings.
+    """
+    all_info = st.session_state.all_sheet_info
+    auto_pairs = st.session_state.auto_pairs
+    unpaired = st.session_state.unpaired_quest
+
+    all_sheets = list(all_info.keys())
+    ov_sheets = [sn for sn, info in all_info.items() if info['type'] == 'option_values']
+    quest_sheets = [sn for sn, info in all_info.items() if info['type'] == 'questionnaire']
+    other_sheets = [sn for sn in all_sheets if sn not in ov_sheets and sn not in quest_sheets]
+
+    # Show what was auto-detected
+    if auto_pairs:
+        st.success(f"Auto-detected {len(auto_pairs)} pair(s):")
+        for q_sheet, ov_sheet in auto_pairs:
+            st.caption(f"  📋 {q_sheet}  ↔  📖 {ov_sheet}")
+
+    if unpaired:
+        st.warning(f"{len(unpaired)} questionnaire sheet(s) could not be auto-paired with an option-values sheet.")
+
+    st.divider()
+
+    # Sheet browser
+    st.subheader("All Sheets in Workbook")
+    st.caption("Expand any sheet to preview its contents, then use the pairing controls below.")
+
+    for sn in all_sheets:
+        info = all_info[sn]
+        with st.expander(f"{sn}", expanded=(sn in unpaired)):
+            _render_sheet_preview(sn, info)
+
+    st.divider()
+
+    # Manual pairing controls
+    st.subheader("Manual Sheet Pairing")
+    st.caption(
+        "Select which sheets are questionnaire data and pair each with its option-values sheet. "
+        "You can add pairs beyond what was auto-detected, or override auto-detected pairs."
+    )
+
+    # How many pairs to configure
+    n_pairs = st.number_input(
+        "Number of timepoints (questionnaire → option-values pairs)",
+        min_value=1, max_value=10,
+        value=max(len(auto_pairs) + len(unpaired), 1),
+        key="n_manual_pairs"
+    )
+
+    # Pre-fill from auto-detected + unpaired
+    prefilled_pairs = list(auto_pairs)
+    for up in unpaired:
+        prefilled_pairs.append((up, ""))
+
+    manual_pairs = []
+    for i in range(int(n_pairs)):
+        st.markdown(f"**Pair {i + 1}**")
+        col1, col2 = st.columns(2)
+
+        # Defaults from prefill
+        default_quest = prefilled_pairs[i][0] if i < len(prefilled_pairs) else all_sheets[0]
+        default_ov = prefilled_pairs[i][1] if i < len(prefilled_pairs) and prefilled_pairs[i][1] else None
+
+        with col1:
+            quest_idx = all_sheets.index(default_quest) if default_quest in all_sheets else 0
+            q_sheet = st.selectbox(
+                "Questionnaire sheet",
+                all_sheets,
+                index=quest_idx,
+                key=f"manual_q_{i}"
+            )
+
+        with col2:
+            ov_options = ["(none — skip)"] + all_sheets
+            if default_ov and default_ov in all_sheets:
+                ov_idx = ov_options.index(default_ov)
+            else:
+                ov_idx = 0
+            ov_sheet = st.selectbox(
+                "Option values sheet",
+                ov_options,
+                index=ov_idx,
+                key=f"manual_ov_{i}"
+            )
+
+        if ov_sheet != "(none — skip)":
+            manual_pairs.append((q_sheet, ov_sheet))
+
+    return manual_pairs
+
+
 def step_upload():
     st.header("Upload & Configure")
 
-    # === WORKFLOW MODE RADIO WITH INFO ICON ===
     import_info = (
         "Upload the VBA-exported JSON configuration **and** the matching ePRO Excel workbook.\n\n"
         "The JSON contains all scale decisions, exclusions, and masks, while the workbook "
@@ -796,7 +1066,6 @@ def step_upload():
         horizontal=True
     )
 
-    # Display tooltip/info below the radio
     if mode.startswith("Import VBA Config"):
         st.caption(import_info)
 
@@ -810,12 +1079,10 @@ def step_upload():
             with st.spinner("Loading configuration..."):
                 config, settings, timepoints = load_config_from_json(config_file.read())
 
-                # Save workbook to temp
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
                     tmp.write(workbook_file.read())
                     tmp_path = tmp.name
 
-                # Compute stats from actual data using config masks
                 all_tp_stats = {}
                 for tp in timepoints:
                     tp.n_included = compute_n_included_from_config(tp, settings)
@@ -827,7 +1094,6 @@ def step_upload():
                                 stats[q.var_name] = s
                     all_tp_stats[tp.name] = stats
 
-                # Build chart titles
                 is_topline = settings.get("is_topline", False)
                 chart_titles = {}
                 for tp in timepoints:
@@ -836,7 +1102,6 @@ def step_upload():
                         raw_title = build_chart_title(tp, text, is_topline)
                         chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
 
-                    # Per-group charts if randomized
                     if tp.needs_unrandomization and tp.randomization_groups:
                         for grp_name in tp.randomization_groups:
                             for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance')]:
@@ -865,10 +1130,16 @@ def step_upload():
         )
         uploaded = st.file_uploader("Upload ePRO Workbook (required)", type=["xlsx", "xls"])
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             is_topline = st.checkbox("TopLine Report", value=False)
         with col2:
+            split_neutral = st.checkbox("Split Neutral", value=False,
+                help="When enabled, neutral/midpoint responses (e.g. \"Neither Agree nor Disagree\") "
+                     "are split 50/50 between the favorable and unfavorable sides rather than being "
+                     "counted as a standalone category. This is common in Likert-scale analysis where "
+                     "the midpoint is considered ambivalent rather than truly neutral.")
+        with col3:
             exclusions_str = st.text_input("Enter Dropped Subjects here", placeholder="e.g. 0042, 0091")
 
         if uploaded and st.button("Process Workbook", type="primary"):
@@ -885,46 +1156,52 @@ def step_upload():
                 tmp.write(uploaded.read())
                 tmp_path = tmp.name
 
-            with st.spinner("Reading workbook..."):
-                sheets = detect_questionnaire_sheets(tmp_path)
-                if not sheets:
-                    st.error("No questionnaire sheets found.")
-                    os.unlink(tmp_path)
-                    return
+            with st.spinner("Scanning workbook sheets..."):
+                pairs, unpaired, all_sheet_info = auto_pair_sheets(tmp_path)
 
-                timepoints = []
-                all_tp_stats = {}
-                for sheet_name, _ in sheets:
-                    ov = find_option_values_sheet(tmp_path, sheet_name)
-                    if not ov: continue
-                    tp = load_timepoint(tmp_path, sheet_name, ov, global_exclusions)
-                    if not tp: continue
-                    stats = {}
-                    for q in tp.questions:
-                        if q.is_scaled:
-                            stats[q.var_name] = compute_stats(tp, q)
-                    timepoints.append(tp)
-                    all_tp_stats[tp.name] = stats
+            st.session_state.tmp_path = tmp_path
+            st.session_state.is_topline = is_topline
+            st.session_state.split_neutral = split_neutral
+            st.session_state.global_exclusions = global_exclusions
+            st.session_state.uploaded_name = uploaded.name
 
-                if not timepoints:
-                    st.error("No valid timepoints found.")
-                    os.unlink(tmp_path)
-                    return
-
-                # Store preliminary data so naming step can access it
-                st.session_state.timepoints = timepoints
-                st.session_state.all_tp_stats = all_tp_stats
-                st.session_state.is_topline = is_topline
-                st.session_state.tmp_path = tmp_path
-                st.session_state.file_processed = True
-                st.session_state.config_loaded = False
-                st.session_state.config_settings = {}
-                st.session_state.pdf_name = f"{Path(uploaded.name).stem}{'_TPL' if is_topline else ''}_Charts_v9.pdf"
-                # Don't build chart_titles yet — wait for naming confirmation
-                st.session_state.chart_titles = {}
-                st.session_state.tp_names_confirmed = False
-                st.session_state.step = 0  # Stay on upload page for naming
+            if pairs and not unpaired:
+                # All sheets auto-paired successfully — proceed directly
+                _process_manual_pairs(pairs, tmp_path, global_exclusions, is_topline, uploaded.name)
+            else:
+                # Need manual intervention
+                st.session_state.auto_pairs = pairs
+                st.session_state.unpaired_quest = unpaired
+                st.session_state.all_sheet_info = all_sheet_info
+                st.session_state.needs_manual_pairing = True
+                st.session_state.manual_pairs_confirmed = False
                 st.rerun()
+
+        # === MANUAL SHEET PAIRING FALLBACK ===
+        if st.session_state.get('needs_manual_pairing') and not st.session_state.get('manual_pairs_confirmed'):
+            st.divider()
+            st.subheader("⚠️ Sheet Pairing Required")
+            st.info(
+                "Auto-detection couldn't fully pair all questionnaire sheets with their option-values sheets. "
+                "Please review the sheets below and confirm the correct pairings."
+            )
+
+            manual_pairs = _render_manual_pairing_ui(st.session_state.tmp_path)
+
+            if st.button("Confirm Pairings & Process", type="primary"):
+                if not manual_pairs:
+                    st.error("Please configure at least one questionnaire ↔ option-values pair.")
+                    return
+
+                tmp_path = st.session_state.tmp_path
+                global_exclusions = st.session_state.get('global_exclusions', [])
+                is_topline = st.session_state.get('is_topline', False)
+                uploaded_name = st.session_state.get('uploaded_name', 'workbook.xlsx')
+
+                st.session_state.needs_manual_pairing = False
+                st.session_state.manual_pairs_confirmed = True
+
+                _process_manual_pairs(manual_pairs, tmp_path, global_exclusions, is_topline, uploaded_name)
 
         # --- Timepoint Naming (shown after workbook is processed) ---
         if st.session_state.file_processed and not st.session_state.config_loaded and not st.session_state.get('tp_names_confirmed', False):
@@ -947,7 +1224,6 @@ def step_upload():
                 updated_names.append(new_name)
 
             if st.button("Confirm Names", type="primary"):
-                # Apply new names and rebuild stats keys + chart titles
                 old_stats = dict(st.session_state.all_tp_stats)
                 new_stats = {}
                 for i, tp in enumerate(timepoints):
@@ -957,7 +1233,6 @@ def step_upload():
 
                 st.session_state.all_tp_stats = new_stats
 
-                # Now build chart titles with confirmed names
                 chart_titles = {}
                 for tp in timepoints:
                     for suffix, text in [('dashboard', 'Summary'), ('ranked', 'Ranked Performance')]:
@@ -970,8 +1245,45 @@ def step_upload():
                 st.session_state.step = 1
                 st.rerun()
 
+
+def _process_manual_pairs(pairs, tmp_path, global_exclusions, is_topline, uploaded_name):
+    """Load timepoints from confirmed questionnaire ↔ OV pairs and store in session."""
+    timepoints = []
+    all_tp_stats = {}
+
+    with st.spinner("Processing timepoints..."):
+        split_neutral = st.session_state.get('split_neutral', False)
+        for quest_sheet, ov_sheet in pairs:
+            tp = load_timepoint(tmp_path, quest_sheet, ov_sheet, global_exclusions)
+            if not tp:
+                continue
+            stats = {}
+            for q in tp.questions:
+                if q.is_scaled:
+                    stats[q.var_name] = compute_stats(tp, q, split_neutral=split_neutral)
+            timepoints.append(tp)
+            all_tp_stats[tp.name] = stats
+
+    if not timepoints:
+        st.error("No valid timepoints could be loaded from the selected pairs. "
+                 "Please check that each questionnaire sheet has SUBJECT ID and STATUS columns, "
+                 "and each option-values sheet has VARIABLE NAME / OPTION NAME / OPTION VALUE columns.")
+        return
+
+    st.session_state.timepoints = timepoints
+    st.session_state.all_tp_stats = all_tp_stats
+    st.session_state.is_topline = is_topline
+    st.session_state.file_processed = True
+    st.session_state.config_loaded = False
+    st.session_state.config_settings = {}
+    st.session_state.pdf_name = f"{Path(uploaded_name).stem}{'_TPL' if is_topline else ''}_Charts_v9.pdf"
+    st.session_state.chart_titles = {}
+    st.session_state.tp_names_confirmed = False
+    st.session_state.step = 0  # Stay on upload for naming
+    st.rerun()
+
+
 def step_config_review_and_generate():
-    """Combined review + generate for config-loaded workflow."""
     st.header("Review & Generate")
 
     timepoints = st.session_state.timepoints
@@ -982,7 +1294,6 @@ def step_config_review_and_generate():
     threshold = settings.get("favorable_threshold", 0.70)
     threshold_pct = threshold * 100
 
-    # Config summary
     st.subheader("Imported Configuration")
 
     col1, col2, col3, col4 = st.columns(4)
@@ -991,7 +1302,6 @@ def step_config_review_and_generate():
     col3.metric("Completed Only", "Yes" if settings.get("completed_only") else "No")
     col4.metric("Split Neutral", "Yes" if settings.get("split_neutral") else "No")
 
-    # Timepoint detail cards
     for tp in timepoints:
         tp_stats = all_tp_stats.get(tp.name, {})
         n_val = tp_stats[next(iter(tp_stats))]['n'] if tp_stats else tp.n_included
@@ -1016,7 +1326,6 @@ def step_config_review_and_generate():
 
     st.divider()
 
-    # Editable titles
     st.subheader("Chart Titles")
     updated_titles = {}
     for chart_id, title in titles.items():
@@ -1026,7 +1335,6 @@ def step_config_review_and_generate():
 
     st.divider()
 
-    # Generate
     if st.session_state.pdf_bytes:
         st.success("PDF generated successfully!")
         st.download_button("Download PDF", data=st.session_state.pdf_bytes,
@@ -1071,7 +1379,7 @@ def _generate_pdf(timepoints, all_tp_stats, titles, is_topline, threshold_pct):
     st.rerun()
 
 
-# === Manual workflow steps (unchanged from v8) ===
+# === Manual workflow steps ===
 
 def step_scales():
     st.header("Verify Favorable Logic")
@@ -1091,7 +1399,6 @@ def step_scales():
             with st.expander(f"Scale Group — {len(q_list)} questions", expanded=True):
                 st.markdown(f"**Scale:** {scale_str}")
 
-                # Group-level edit
                 current_fav = ", ".join(map(str, ex_q.fav_mask))
                 group_key = f"fav_group_{tp.name}_{id(ex_q)}"
                 new_fav = st.text_input("Favorable values (applies to all in group)", value=current_fav, key=group_key)
@@ -1101,11 +1408,9 @@ def step_scales():
                 except:
                     group_mask = ex_q.fav_mask
 
-                # Apply group mask to all questions (overrides will replace below)
                 for q in q_list:
                     q.fav_mask = list(group_mask)
 
-                # Question summary table
                 q_data = []
                 for q in q_list:
                     fav_str = ", ".join(map(str, q.fav_mask)) if q.fav_mask else "None"
@@ -1113,7 +1418,6 @@ def step_scales():
                                    "Question": q.question_text[:80]})
                 st.dataframe(pd.DataFrame(q_data), use_container_width=True, hide_index=True)
 
-                # Per-question overrides
                 if len(q_list) > 1:
                     override_key = f"show_overrides_{tp.name}_{id(ex_q)}"
                     show_overrides = st.checkbox("Show per-question overrides", key=override_key, value=False)
@@ -1143,10 +1447,11 @@ def step_scales():
                                     pass
 
     if st.button("Confirm Scales", type="primary"):
+        split_neutral = st.session_state.get('split_neutral', False)
         for tp in st.session_state.timepoints:
             stats = {}
             for q in tp.questions:
-                if q.is_scaled: stats[q.var_name] = compute_stats(tp, q)
+                if q.is_scaled: stats[q.var_name] = compute_stats(tp, q, split_neutral=split_neutral)
             st.session_state.all_tp_stats[tp.name] = stats
         st.session_state.step = 2
         st.rerun()
@@ -1182,7 +1487,6 @@ def step_subjects():
     if not any_non_completed:
         st.success("All subjects completed across all timepoints.")
 
-    # Show summary of analyzed vs excluded subjects per timepoint
     st.divider()
     st.subheader("Subject Summary")
     for tp in timepoints:
@@ -1202,10 +1506,11 @@ def step_subjects():
                     st.caption("None")
 
     if st.button("Confirm Subjects", type="primary"):
+        split_neutral = st.session_state.get('split_neutral', False)
         for tp in st.session_state.timepoints:
             stats = {}
             for q in tp.questions:
-                if q.is_scaled: stats[q.var_name] = compute_stats(tp, q)
+                if q.is_scaled: stats[q.var_name] = compute_stats(tp, q, split_neutral=split_neutral)
             st.session_state.all_tp_stats[tp.name] = stats
         st.session_state.step = 3
         st.rerun()
@@ -1238,7 +1543,6 @@ def step_generate_manual():
     col2.metric("Total Charts", len(titles))
     col3.metric("Center", CENTER_FILTER)
 
-    # Per-timepoint n counts
     tp_cols = st.columns(len(timepoints))
     for i, tp in enumerate(timepoints):
         tp_cols[i].metric(f"n — {tp.name}", tp.n_included)
@@ -1255,21 +1559,20 @@ def step_generate_manual():
     if st.button("Generate PDF", type="primary"):
         _generate_pdf(timepoints, all_tp_stats, titles, is_topline, threshold_pct)
 
+
 # ═══════════════════════════════════════════════════════════════
-# 8. MAIN APP ENTRY
+# 9. MAIN APP ENTRY
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    st.set_page_config(page_title="ePRO Chart Generator v9", page_icon="📊", layout="wide")
+    st.set_page_config(page_title="ePRO Chart Generator v9.1", page_icon="📊", layout="wide")
 
     init_session_state()
     render_sidebar()
 
     if st.session_state.config_loaded:
-        # Config workflow: Upload -> Review+Generate (2 steps)
         step_funcs = [step_upload, step_config_review_and_generate]
     else:
-        # Manual workflow: Upload -> Scales -> Subjects -> Titles -> Generate (5 steps)
         step_funcs = [step_upload, step_scales, step_subjects, step_titles, step_generate_manual]
 
     current = min(st.session_state.step, len(step_funcs) - 1)
@@ -1278,4 +1581,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
