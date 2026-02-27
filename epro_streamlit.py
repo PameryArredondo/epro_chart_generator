@@ -975,13 +975,13 @@ def step_upload():
                 is_topline = settings.get("is_topline", False)
                 chart_titles = {}
                 for tp in timepoints:
-                    chart_id = f"{tp.name}_dashboard"
+                    chart_id = f"{tp.name}_bar_chart"
                     raw_title = build_chart_title(tp, "Summary", is_topline)
                     chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
 
                     if tp.needs_unrandomization and tp.randomization_groups:
                         for grp_name in tp.randomization_groups:
-                            chart_id = f"{tp.name}_{grp_name}_dashboard"
+                            chart_id = f"{tp.name}_{grp_name}_bar_chart"
                             raw_title = build_chart_title(tp, f"{grp_name} Summary", is_topline)
                             chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
 
@@ -1109,7 +1109,7 @@ def step_upload():
 
                 chart_titles = {}
                 for tp in timepoints:
-                    chart_id = f"{tp.name}_dashboard"
+                    chart_id = f"{tp.name}_bar_chart"
                     raw_title = build_chart_title(tp, "Summary", is_topline)
                     chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
 
@@ -1231,10 +1231,10 @@ def _generate_pdf(timepoints, all_tp_stats, titles, is_topline, threshold_pct):
             stats = all_tp_stats.get(tp.name, {})
 
             fig = create_dashboard_page(tp, stats, is_topline, threshold_pct,
-                                        custom_title=titles.get(f"{tp.name}_dashboard"))
+                                        custom_title=titles.get(f"{tp.name}_bar_chart"))
             if fig: pdf.savefig(fig); plt.close(fig)
             chart_count += 1
-            progress.progress(chart_count / total, text=f"{tp.name} dashboard...")
+            progress.progress(chart_count / total, text=f"{tp.name} bar chart...")
 
         if len(timepoints) >= 2:
             fig = create_comparison_page(timepoints, all_tp_stats)
