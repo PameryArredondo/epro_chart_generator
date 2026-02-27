@@ -677,7 +677,7 @@ def create_dashboard_page(tp, all_stats, is_topline, threshold_pct, custom_title
     ax.set_ylabel("Favorable Response (%)")
     ax.set_ylim(0, 105)
 
-    ax.axhline(thresh_val, color='#D55E00', linestyle='--', alpha=0.9, linewidth=2.5, zorder=5)
+    ax.axhline(thresh_val, color='#0173B2', linestyle='--', alpha=0.9, linewidth=2.5, zorder=5)
 
 
     return fig
@@ -975,13 +975,13 @@ def step_upload():
                 is_topline = settings.get("is_topline", False)
                 chart_titles = {}
                 for tp in timepoints:
-                    chart_id = f"{tp.name}_bar_chart"
+                    chart_id = f"{tp.name}_dashboard"
                     raw_title = build_chart_title(tp, "Summary", is_topline)
                     chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
 
                     if tp.needs_unrandomization and tp.randomization_groups:
                         for grp_name in tp.randomization_groups:
-                            chart_id = f"{tp.name}_{grp_name}_bar_chart"
+                            chart_id = f"{tp.name}_{grp_name}_dashboard"
                             raw_title = build_chart_title(tp, f"{grp_name} Summary", is_topline)
                             chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
 
@@ -1109,7 +1109,7 @@ def step_upload():
 
                 chart_titles = {}
                 for tp in timepoints:
-                    chart_id = f"{tp.name}_bar_chart"
+                    chart_id = f"{tp.name}_dashboard"
                     raw_title = build_chart_title(tp, "Summary", is_topline)
                     chart_titles[chart_id] = clean_chart_title(chart_id, raw_title)
 
@@ -1231,10 +1231,10 @@ def _generate_pdf(timepoints, all_tp_stats, titles, is_topline, threshold_pct):
             stats = all_tp_stats.get(tp.name, {})
 
             fig = create_dashboard_page(tp, stats, is_topline, threshold_pct,
-                                        custom_title=titles.get(f"{tp.name}_bar_chart"))
+                                        custom_title=titles.get(f"{tp.name}_dashboard"))
             if fig: pdf.savefig(fig); plt.close(fig)
             chart_count += 1
-            progress.progress(chart_count / total, text=f"{tp.name} bar chart...")
+            progress.progress(chart_count / total, text=f"{tp.name} dashboard...")
 
         if len(timepoints) >= 2:
             fig = create_comparison_page(timepoints, all_tp_stats)
