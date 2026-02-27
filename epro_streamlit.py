@@ -677,7 +677,7 @@ def create_dashboard_page(tp, all_stats, is_topline, threshold_pct, custom_title
     ax.set_ylabel("Favorable Response (%)")
     ax.set_ylim(0, 105)
 
-    ax.axhline(thresh_val, color='#0173B2', linestyle='--', alpha=0.9, linewidth=2.5, zorder=5)
+    ax.axhline(thresh_val, color='#000000', linestyle='--', alpha=0.9, linewidth=2.0, zorder=5)
 
 
     return fig
@@ -1447,3 +1447,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
